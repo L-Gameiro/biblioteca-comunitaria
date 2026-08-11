@@ -1,0 +1,17 @@
+# Segredos — nunca versionar
+.streamlit/secrets.toml
+
+# Bancos locais (SQLite de teste / protótipos antigos)
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# SO
+.DS_Store

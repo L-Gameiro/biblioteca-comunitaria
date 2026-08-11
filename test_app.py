@@ -8,19 +8,30 @@ Cobre:
      gerado, sequencial incremental por autor no lote, status inválido,
      campos obrigatórios vazios, duplicidade de código no CSV e contra o
      banco)
+
+Os testes usam SQLite local descartável através da mesma camada SQLAlchemy
+usada em produção (Postgres/Supabase) — não dependem de acesso de rede.
 """
 
-import sqlite3
-
 import pytest
+from sqlalchemy import text
 
+import app
 from app import (
     add_book,
     create_schema,
+    create_user,
     generate_book_code,
+    get_connection,
+    get_engine,
+    get_user_by_email,
+    init_db,
     is_valid_email,
     parse_csv_bytes,
     process_import_rows,
+    request_loan,
+    return_loan,
+    verify_password,
 )
 
 
@@ -29,10 +40,11 @@ from app import (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def conn():
-    connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    create_schema(connection)
+def conn(tmp_path):
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    engine = get_engine(database_url)
+    create_schema(engine)
+    connection = get_connection(database_url)
     yield connection
     connection.close()
 
@@ -214,7 +226,7 @@ def test_codigo_duplicado_dentro_do_proprio_csv_e_sinalizado(conn):
 def test_codigo_duplicado_contra_livro_ja_existente_no_banco_e_sinalizado(conn):
     add_book(conn, "Livro Existente", "Fulano de Tal", "Romance")
     conn.commit()
-    existing_code = conn.execute("SELECT code FROM books").fetchone()["code"]
+    existing_code = conn.execute(text("SELECT code FROM books")).mappings().first()["code"]
 
     rows = [{"titulo": "Livro Novo", "autor": "Outro Autor", "codigo": existing_code}]
     processed, summary = process_import_rows(conn, rows)
@@ -268,3 +280,66 @@ def test_resumo_estatistico_mistura_mantidos_gerados_e_erros(conn):
     assert summary["mantidos"] == 1
     assert summary["gerados"] == 2
     assert summary["com_erro"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Camada de banco (SQLAlchemy) — init_db, engine/conexão, empréstimos
+# ---------------------------------------------------------------------------
+
+def test_init_db_cria_schema_admin_e_seed_de_forma_idempotente(tmp_path):
+    database_url = f"sqlite:///{tmp_path}/init.db"
+    init_db(database_url)
+    init_db(database_url)  # chamado 2x, como acontece a cada rerun do Streamlit
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        assert admin is not None
+        assert admin["role"] == "admin"
+        assert verify_password("admin123", admin["password_hash"], admin["salt"])
+
+        user_count = connection.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"]
+        book_count = connection.execute(text("SELECT COUNT(*) AS n FROM books")).mappings().first()["n"]
+        assert user_count == 1  # não duplicou o admin na 2ª chamada
+        assert book_count == 4  # não duplicou a carga inicial de livros
+
+
+def test_get_connection_sem_database_url_levanta_erro_claro(monkeypatch):
+    monkeypatch.setattr(app.st, "secrets", {})
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        app.get_engine()
+
+
+def test_fluxo_completo_de_emprestimo_e_devolucao(conn):
+    create_user(conn, "Leitor Teste", "leitor@teste.org", "11999999999", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor@teste.org")
+
+    code = add_book(conn, "1984", "George Orwell", "Distopia")
+    conn.commit()
+    book = conn.execute(text("SELECT * FROM books WHERE code = :code"), {"code": code}).mappings().first()
+    assert book["status"] == "Disponível"
+
+    request_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+    book_after_loan = conn.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book["id"]}
+    ).mappings().first()
+    assert book_after_loan["status"] == "Emprestado"
+
+    with pytest.raises(ValueError):
+        request_loan(conn, book["id"], leitor["id"])
+
+    active_loan = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :book_id AND status = 'ativo'"),
+        {"book_id": book["id"]},
+    ).mappings().first()
+    return_loan(conn, active_loan["id"])
+    conn.commit()
+
+    book_after_return = conn.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book["id"]}
+    ).mappings().first()
+    assert book_after_return["status"] == "Disponível"
+
+    with pytest.raises(ValueError):
+        return_loan(conn, active_loan["id"])

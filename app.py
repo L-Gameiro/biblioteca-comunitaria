@@ -1,11 +1,12 @@
 """
 app.py — Protótipo funcional: Sistema de Biblioteca Comunitária
 =================================================================
-Stack: Python + Streamlit + SQLite (lógica de negócio e UI num único
-arquivo). Ver README.md para instruções completas.
+Stack: Python + Streamlit + Postgres (Supabase) via SQLAlchemy (lógica de
+negócio e UI num único arquivo). Ver README.md para instruções completas.
 
 Como rodar:
     pip install -r requirements.txt
+    cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # preencha DATABASE_URL
     streamlit run app.py
 
 Login de administrador criado automaticamente na 1ª execução:
@@ -25,12 +26,22 @@ import io
 import os
 import re
 import unicodedata
-from contextlib import closing
 from datetime import datetime
+from functools import lru_cache
 
 import streamlit as st
-
-DB_PATH = "biblioteca.db"
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Integer,
+    MetaData,
+    Table,
+    Text,
+    create_engine,
+    text,
+)
+from sqlalchemy.engine import Connection, Engine
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +96,80 @@ def generate_book_code(
 
 
 # ---------------------------------------------------------------------------
-# Banco de dados
+# Banco de dados (Postgres/Supabase via SQLAlchemy; SQLite local para testes)
 # ---------------------------------------------------------------------------
 
-def get_connection():
-    import sqlite3
+metadata = MetaData()
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
+users_table = Table(
+    "users",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("full_name", Text, nullable=False),
+    Column("email", Text, nullable=False, unique=True),
+    Column("phone", Text),
+    Column("password_hash", Text, nullable=False),
+    Column("salt", Text, nullable=False),
+    Column("role", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint("role IN ('admin','leitor')", name="ck_users_role"),
+)
+
+books_table = Table(
+    "books",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("code", Text, nullable=False, unique=True),
+    Column("title", Text, nullable=False),
+    Column("author", Text, nullable=False),
+    Column("category", Text),
+    Column("status", Text, nullable=False, server_default="Disponível"),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint(
+        "status IN ('Disponível','Emprestado','Em Manutenção')", name="ck_books_status"
+    ),
+)
+
+loans_table = Table(
+    "loans",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("book_id", Integer, ForeignKey("books.id"), nullable=False),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("loan_date", Text, nullable=False),
+    Column("return_date", Text),
+    Column("status", Text, nullable=False, server_default="ativo"),
+    CheckConstraint("status IN ('ativo','devolvido')", name="ck_loans_status"),
+)
+
+
+def _get_database_url_from_secrets() -> str:
+    try:
+        return st.secrets["DATABASE_URL"]
+    except Exception as exc:
+        raise RuntimeError(
+            "DATABASE_URL não encontrada em st.secrets. Copie "
+            ".streamlit/secrets.toml.example para .streamlit/secrets.toml e "
+            "preencha com a connection string do Supabase (ou configure os "
+            "Secrets do Streamlit Community Cloud em produção)."
+        ) from exc
+
+
+@lru_cache(maxsize=8)
+def _build_engine(database_url: str) -> Engine:
+    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    return create_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
+
+
+def get_engine(database_url: str | None = None) -> Engine:
+    return _build_engine(database_url or _get_database_url_from_secrets())
+
+
+def get_connection(database_url: str | None = None) -> Connection:
+    engine = get_engine(database_url)
+    conn = engine.connect()
+    if engine.dialect.name == "sqlite":
+        conn.execute(text("PRAGMA foreign_keys = ON"))
     return conn
 
 
@@ -109,61 +185,27 @@ def verify_password(password: str, digest: str, salt: str) -> bool:
     return check == digest
 
 
-def create_schema(conn):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            phone TEXT,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin','leitor')),
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS books (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            author TEXT NOT NULL,
-            category TEXT,
-            status TEXT NOT NULL DEFAULT 'Disponível'
-                CHECK(status IN ('Disponível','Emprestado','Em Manutenção')),
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS loans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            loan_date TEXT NOT NULL,
-            return_date TEXT,
-            status TEXT NOT NULL DEFAULT 'ativo' CHECK(status IN ('ativo','devolvido')),
-            FOREIGN KEY(book_id) REFERENCES books(id),
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
+def create_schema(engine: Engine) -> None:
+    metadata.create_all(engine)
 
 
-def init_db():
-    with closing(get_connection()) as conn, conn:
-        create_schema(conn)
+_initialized_engine_ids: set[int] = set()
 
-        if conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0:
+
+def init_db(database_url: str | None = None) -> None:
+    engine = get_engine(database_url)
+    if id(engine) in _initialized_engine_ids:
+        return
+
+    create_schema(engine)
+    with get_connection(database_url) as conn:
+        if conn.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"] == 0:
             create_user(
                 conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin"
             )
+            conn.commit()
 
-        if conn.execute("SELECT COUNT(*) AS n FROM books").fetchone()["n"] == 0:
+        if conn.execute(text("SELECT COUNT(*) AS n FROM books")).mappings().first()["n"] == 0:
             seed = [
                 ("Dom Casmurro", "Machado de Assis", "Literatura Brasileira"),
                 ("Grande Sertão: Veredas", "João Guimarães Rosa", "Literatura Brasileira"),
@@ -172,6 +214,9 @@ def init_db():
             ]
             for title, author, category in seed:
                 add_book(conn, title, author, category)
+            conn.commit()
+
+    _initialized_engine_ids.add(id(engine))
 
 
 # ---------------------------------------------------------------------------
@@ -182,17 +227,28 @@ def create_user(conn, full_name, email, phone, password, role):
     digest, salt = hash_password(password)
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
-        """INSERT INTO users
-           (full_name, email, phone, password_hash, salt, role, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (full_name, email.lower().strip(), phone, digest, salt, role, now),
+        text(
+            """INSERT INTO users
+               (full_name, email, phone, password_hash, salt, role, created_at)
+               VALUES (:full_name, :email, :phone, :password_hash, :salt, :role, :created_at)"""
+        ),
+        {
+            "full_name": full_name,
+            "email": email.lower().strip(),
+            "phone": phone,
+            "password_hash": digest,
+            "salt": salt,
+            "role": role,
+            "created_at": now,
+        },
     )
 
 
 def get_user_by_email(conn, email):
     return conn.execute(
-        "SELECT * FROM users WHERE email = ?", (email.lower().strip(),)
-    ).fetchone()
+        text("SELECT * FROM users WHERE email = :email"),
+        {"email": email.lower().strip()},
+    ).mappings().first()
 
 
 def authenticate(conn, email, password):
@@ -215,8 +271,9 @@ def is_valid_email(email: str) -> bool:
 
 def count_books_by_author(conn, author: str) -> int:
     return conn.execute(
-        "SELECT COUNT(*) AS n FROM books WHERE author = ?", (author,)
-    ).fetchone()["n"]
+        text("SELECT COUNT(*) AS n FROM books WHERE author = :author"),
+        {"author": author},
+    ).mappings().first()["n"]
 
 
 def add_book(conn, title, author, category):
@@ -224,9 +281,18 @@ def add_book(conn, title, author, category):
     code = generate_book_code(author, existing)
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
-        """INSERT INTO books (code, title, author, category, status, created_at)
-           VALUES (?,?,?,?,?,?)""",
-        (code, title, author, category, "Disponível", now),
+        text(
+            """INSERT INTO books (code, title, author, category, status, created_at)
+               VALUES (:code, :title, :author, :category, :status, :created_at)"""
+        ),
+        {
+            "code": code,
+            "title": title,
+            "author": author,
+            "category": category,
+            "status": "Disponível",
+            "created_at": now,
+        },
     )
     return code
 
@@ -269,9 +335,7 @@ def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
 
     Retorna (linhas_processadas, resumo_estatistico).
     """
-    existing_codes = {
-        row["code"] for row in conn.execute("SELECT code FROM books").fetchall()
-    }
+    existing_codes = set(conn.execute(text("SELECT code FROM books")).scalars().all())
     used_codes_in_batch: set[str] = set()
     author_batch_counts: dict[str, int] = {}
 
@@ -352,9 +416,18 @@ def commit_import(conn, processed_rows: list[dict]) -> int:
     count = 0
     for row in processed_rows:
         conn.execute(
-            """INSERT INTO books (code, title, author, category, status, created_at)
-               VALUES (?,?,?,?,?,?)""",
-            (row["codigo"], row["titulo"], row["autor"], row["categoria"], row["status"], now),
+            text(
+                """INSERT INTO books (code, title, author, category, status, created_at)
+                   VALUES (:code, :title, :author, :category, :status, :created_at)"""
+            ),
+            {
+                "code": row["codigo"],
+                "title": row["titulo"],
+                "author": row["autor"],
+                "category": row["categoria"],
+                "status": row["status"],
+                "created_at": now,
+            },
         )
         count += 1
     return count
@@ -365,26 +438,38 @@ def commit_import(conn, processed_rows: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 def request_loan(conn, book_id, user_id):
-    book = conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
+    ).mappings().first()
     if book is None or book["status"] != "Disponível":
         raise ValueError("Livro indisponível para empréstimo.")
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
-        "INSERT INTO loans (book_id, user_id, loan_date, status) VALUES (?,?,?,?)",
-        (book_id, user_id, now, "ativo"),
+        text(
+            "INSERT INTO loans (book_id, user_id, loan_date, status) "
+            "VALUES (:book_id, :user_id, :loan_date, :status)"
+        ),
+        {"book_id": book_id, "user_id": user_id, "loan_date": now, "status": "ativo"},
     )
-    conn.execute("UPDATE books SET status='Emprestado' WHERE id=?", (book_id,))
+    conn.execute(
+        text("UPDATE books SET status = 'Emprestado' WHERE id = :id"), {"id": book_id}
+    )
 
 
 def return_loan(conn, loan_id):
-    loan = conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
+    loan = conn.execute(
+        text("SELECT * FROM loans WHERE id = :id"), {"id": loan_id}
+    ).mappings().first()
     if loan is None or loan["status"] != "ativo":
         raise ValueError("Empréstimo não está ativo.")
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
-        "UPDATE loans SET status='devolvido', return_date=? WHERE id=?", (now, loan_id)
+        text("UPDATE loans SET status = 'devolvido', return_date = :return_date WHERE id = :id"),
+        {"return_date": now, "id": loan_id},
     )
-    conn.execute("UPDATE books SET status='Disponível' WHERE id=?", (loan["book_id"],))
+    conn.execute(
+        text("UPDATE books SET status = 'Disponível' WHERE id = :id"), {"id": loan["book_id"]}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +525,7 @@ def show_auth_screen(conn):
 def show_catalog(conn, user):
     st.header("Catálogo de Livros")
     query = st.text_input("Buscar por título, autor, código ou categoria")
-    rows = conn.execute("SELECT * FROM books ORDER BY title").fetchall()
+    rows = conn.execute(text("SELECT * FROM books ORDER BY title")).mappings().all()
 
     if query:
         q = query.lower()
@@ -491,7 +576,7 @@ def show_book_management(conn):
 
     st.subheader("Livros cadastrados")
     statuses = ["Disponível", "Emprestado", "Em Manutenção"]
-    rows = conn.execute("SELECT * FROM books ORDER BY id DESC").fetchall()
+    rows = conn.execute(text("SELECT * FROM books ORDER BY id DESC")).mappings().all()
     for r in rows:
         with st.expander(f"{r['code']} — {r['title']}"):
             with st.form(f"edit_form_{r['id']}"):
@@ -511,14 +596,25 @@ def show_book_management(conn):
                 delete = col2.form_submit_button("🗑️ Remover livro")
                 if save:
                     conn.execute(
-                        "UPDATE books SET title=?, author=?, category=?, status=? WHERE id=?",
-                        (title, author, category, status, r["id"]),
+                        text(
+                            "UPDATE books SET title = :title, author = :author, "
+                            "category = :category, status = :status WHERE id = :id"
+                        ),
+                        {
+                            "title": title,
+                            "author": author,
+                            "category": category,
+                            "status": status,
+                            "id": r["id"],
+                        },
                     )
                     conn.commit()
                     st.success("Livro atualizado.")
                     st.rerun()
                 if delete:
-                    conn.execute("DELETE FROM books WHERE id=?", (r["id"],))
+                    conn.execute(
+                        text("DELETE FROM books WHERE id = :id"), {"id": r["id"]}
+                    )
                     conn.commit()
                     st.warning("Livro removido.")
                     st.rerun()
@@ -527,30 +623,116 @@ def show_book_management(conn):
 def show_loan_management(conn):
     st.header("Empréstimos ativos")
     rows = conn.execute(
-        """
-        SELECT loans.id AS loan_id, books.title, books.code,
-               users.full_name, loans.loan_date
-        FROM loans
-        JOIN books ON books.id = loans.book_id
-        JOIN users ON users.id = loans.user_id
-        WHERE loans.status = 'ativo'
-        ORDER BY loans.loan_date
-        """
-    ).fetchall()
+        text(
+            """
+            SELECT loans.id AS loan_id, books.title, books.code,
+                   users.full_name, users.email, users.phone, loans.loan_date
+            FROM loans
+            JOIN books ON books.id = loans.book_id
+            JOIN users ON users.id = loans.user_id
+            WHERE loans.status = 'ativo'
+            ORDER BY loans.loan_date
+            """
+        )
+    ).mappings().all()
 
     if not rows:
         st.info("Nenhum empréstimo ativo no momento.")
 
     for r in rows:
-        cols = st.columns([3, 2, 3, 2])
+        cols = st.columns([3, 2, 3, 2, 2, 2])
         cols[0].write(f"**{r['title']}** ({r['code']})")
         cols[1].write(r["full_name"])
-        cols[2].write(f"Emprestado em {r['loan_date']}")
-        if cols[3].button("✅ Registrar devolução", key=f"return_{r['loan_id']}"):
+        cols[2].write(r["email"])
+        cols[3].write(r["phone"] or "-")
+        cols[4].write(f"Emprestado em {r['loan_date']}")
+        if cols[5].button("✅ Registrar devolução", key=f"return_{r['loan_id']}"):
             return_loan(conn, r["loan_id"])
             conn.commit()
             st.success("Devolução registrada.")
             st.rerun()
+
+
+def show_admin_loan_history(conn):
+    st.header("Histórico completo de empréstimos")
+
+    rows = conn.execute(
+        text(
+            """
+            SELECT loans.id AS loan_id, loans.loan_date, loans.return_date, loans.status,
+                   books.id AS book_id, books.title AS book_title, books.code AS book_code,
+                   users.id AS user_id, users.full_name, users.email, users.phone
+            FROM loans
+            JOIN books ON books.id = loans.book_id
+            JOIN users ON users.id = loans.user_id
+            ORDER BY loans.loan_date DESC
+            """
+        )
+    ).mappings().all()
+
+    if not rows:
+        st.info("Nenhum empréstimo registrado ainda.")
+        return
+
+    book_options = {"Todos": None}
+    for title, code, book_id in sorted(
+        {(r["book_title"], r["book_code"], r["book_id"]) for r in rows}
+    ):
+        book_options[f"{title} ({code})"] = book_id
+
+    user_options = {"Todos": None}
+    for name, email, user_id in sorted(
+        {(r["full_name"], r["email"], r["user_id"]) for r in rows}
+    ):
+        user_options[f"{name} ({email})"] = user_id
+
+    loan_dates = [datetime.fromisoformat(r["loan_date"]).date() for r in rows]
+
+    col1, col2, col3 = st.columns(3)
+    book_choice = col1.selectbox("Filtrar por livro", list(book_options.keys()))
+    user_choice = col2.selectbox("Filtrar por usuário", list(user_options.keys()))
+    date_range = col3.date_input(
+        "Período (data de empréstimo)",
+        value=(min(loan_dates), max(loan_dates)),
+    )
+
+    filtered = rows
+    if book_options[book_choice] is not None:
+        filtered = [r for r in filtered if r["book_id"] == book_options[book_choice]]
+    if user_options[user_choice] is not None:
+        filtered = [r for r in filtered if r["user_id"] == user_options[user_choice]]
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start, end = date_range
+        filtered = [
+            r
+            for r in filtered
+            if start <= datetime.fromisoformat(r["loan_date"]).date() <= end
+        ]
+
+    st.write(f"{len(filtered)} empréstimo(s) encontrado(s).")
+    status_emoji = {"ativo": "🔴", "devolvido": "🟢"}
+    table = [
+        {
+            "Livro": f"{r['book_title']} ({r['book_code']})",
+            "Leitor": r["full_name"],
+            "E-mail": r["email"],
+            "Telefone": r["phone"] or "-",
+            "Emprestado em": r["loan_date"],
+            "Devolvido em": r["return_date"] or "-",
+            "Status": f"{status_emoji.get(r['status'], '')} {r['status']}",
+        }
+        for r in filtered
+    ]
+    st.dataframe(table, width="stretch")
+
+    if user_options[user_choice] is not None:
+        user_loans = [r for r in rows if r["user_id"] == user_options[user_choice]]
+        with st.expander(f"📋 Todos os empréstimos de {user_choice}", expanded=True):
+            for r in user_loans:
+                st.write(
+                    f"- **{r['book_title']}** ({r['book_code']}) — "
+                    f"{r['loan_date']} → {r['return_date'] or 'em aberto'} [{r['status']}]"
+                )
 
 
 def show_my_loans(conn, user):
@@ -558,13 +740,15 @@ def show_my_loans(conn, user):
 
     st.subheader("Livros em minha posse")
     active = conn.execute(
-        """
-        SELECT loans.id AS loan_id, books.title, books.code, loans.loan_date
-        FROM loans JOIN books ON books.id = loans.book_id
-        WHERE loans.user_id = ? AND loans.status = 'ativo'
-        """,
-        (user["id"],),
-    ).fetchall()
+        text(
+            """
+            SELECT loans.id AS loan_id, books.title, books.code, loans.loan_date
+            FROM loans JOIN books ON books.id = loans.book_id
+            WHERE loans.user_id = :user_id AND loans.status = 'ativo'
+            """
+        ),
+        {"user_id": user["id"]},
+    ).mappings().all()
 
     if not active:
         st.info("Você não tem livros emprestados no momento.")
@@ -580,14 +764,16 @@ def show_my_loans(conn, user):
 
     st.subheader("Histórico completo")
     history = conn.execute(
-        """
-        SELECT books.title, books.code, loans.loan_date, loans.return_date, loans.status
-        FROM loans JOIN books ON books.id = loans.book_id
-        WHERE loans.user_id = ?
-        ORDER BY loans.loan_date DESC
-        """,
-        (user["id"],),
-    ).fetchall()
+        text(
+            """
+            SELECT books.title, books.code, loans.loan_date, loans.return_date, loans.status
+            FROM loans JOIN books ON books.id = loans.book_id
+            WHERE loans.user_id = :user_id
+            ORDER BY loans.loan_date DESC
+            """
+        ),
+        {"user_id": user["id"]},
+    ).mappings().all()
     for r in history:
         st.write(
             f"- **{r['title']}** ({r['code']}) — {r['loan_date']} → "
@@ -643,7 +829,7 @@ def show_csv_import(conn):
         }
         for r in processed
     ]
-    st.dataframe(preview_table, use_container_width=True)
+    st.dataframe(preview_table, width="stretch")
 
     error_rows = [r for r in preview_table if r["Erros"]]
     if error_rows:
@@ -651,7 +837,7 @@ def show_csv_import(conn):
             f"{len(error_rows)} linha(s) com erro bloqueante. "
             "Corrija o arquivo e reenvie antes de confirmar a importação."
         )
-        st.dataframe(error_rows, use_container_width=True)
+        st.dataframe(error_rows, width="stretch")
 
     if st.button("Confirmar importação", disabled=bool(error_rows)):
         count = commit_import(conn, processed)
@@ -669,7 +855,14 @@ def show_app(conn):
         st.caption("Perfil: " + ("Administrador" if user["role"] == "admin" else "Leitor"))
         if user["role"] == "admin":
             page = st.radio(
-                "Menu", ["Catálogo", "Gestão de Livros", "Empréstimos", "Importar CSV"]
+                "Menu",
+                [
+                    "Catálogo",
+                    "Gestão de Livros",
+                    "Empréstimos",
+                    "Histórico completo",
+                    "Importar CSV",
+                ],
             )
         else:
             page = st.radio("Menu", ["Catálogo", "Meus Empréstimos"])
@@ -683,6 +876,8 @@ def show_app(conn):
         show_book_management(conn)
     elif page == "Empréstimos":
         show_loan_management(conn)
+    elif page == "Histórico completo":
+        show_admin_loan_history(conn)
     elif page == "Meus Empréstimos":
         show_my_loans(conn, user)
     elif page == "Importar CSV":
@@ -696,7 +891,7 @@ def main():
     if "user" not in st.session_state:
         st.session_state.user = None
 
-    with closing(get_connection()) as conn:
+    with get_connection() as conn:
         if st.session_state.user is None:
             show_auth_screen(conn)
         else:
