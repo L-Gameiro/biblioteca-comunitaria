@@ -42,6 +42,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import IntegrityError
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +296,36 @@ def add_book(conn, title, author, category):
         },
     )
     return code
+
+
+def get_active_loan_for_book(conn, book_id):
+    return conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :book_id AND status = 'ativo'"),
+        {"book_id": book_id},
+    ).mappings().first()
+
+
+def count_loans_for_book(conn, book_id) -> int:
+    return conn.execute(
+        text("SELECT COUNT(*) AS n FROM loans WHERE book_id = :book_id"),
+        {"book_id": book_id},
+    ).mappings().first()["n"]
+
+
+def delete_book(conn, book_id) -> None:
+    """Remove um livro e todo o seu histórico de empréstimos (já devolvidos),
+    de forma atômica: as duas exclusões acontecem na mesma transação e só
+    persistem quando o chamador der commit.
+
+    Levanta ValueError se houver empréstimo ATIVO para o livro — controle do
+    exemplar físico em posse de alguém, que precisa ser devolvido antes.
+    """
+    if get_active_loan_for_book(conn, book_id) is not None:
+        raise ValueError(
+            "Este livro está emprestado no momento. Registre a devolução antes de removê-lo."
+        )
+    conn.execute(text("DELETE FROM loans WHERE book_id = :book_id"), {"book_id": book_id})
+    conn.execute(text("DELETE FROM books WHERE id = :id"), {"id": book_id})
 
 
 # ---------------------------------------------------------------------------
@@ -591,10 +622,7 @@ def show_book_management(conn):
                     index=statuses.index(r["status"]),
                     key=f"s_{r['id']}",
                 )
-                col1, col2 = st.columns(2)
-                save = col1.form_submit_button("Salvar alterações")
-                delete = col2.form_submit_button("🗑️ Remover livro")
-                if save:
+                if st.form_submit_button("Salvar alterações"):
                     conn.execute(
                         text(
                             "UPDATE books SET title = :title, author = :author, "
@@ -611,13 +639,45 @@ def show_book_management(conn):
                     conn.commit()
                     st.success("Livro atualizado.")
                     st.rerun()
-                if delete:
-                    conn.execute(
-                        text("DELETE FROM books WHERE id = :id"), {"id": r["id"]}
-                    )
-                    conn.commit()
-                    st.warning("Livro removido.")
-                    st.rerun()
+
+            st.markdown("---")
+            active_loan = get_active_loan_for_book(conn, r["id"])
+            loan_count = count_loans_for_book(conn, r["id"])
+
+            if active_loan is not None:
+                st.error(
+                    "Este livro está emprestado no momento. Registre a devolução "
+                    "antes de removê-lo."
+                )
+            elif loan_count > 0:
+                confirm = st.checkbox(
+                    f"Confirmo a remoção do livro **{r['title']}** e de "
+                    f"**{loan_count}** registro(s) de empréstimo/devolução associado(s).",
+                    key=f"confirm_delete_{r['id']}",
+                )
+                if st.button(
+                    "🗑️ Remover livro e histórico",
+                    key=f"delete_{r['id']}",
+                    disabled=not confirm,
+                ):
+                    try:
+                        delete_book(conn, r["id"])
+                        conn.commit()
+                        st.warning("Livro e histórico de empréstimos removidos.")
+                        st.rerun()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(f"Não foi possível remover o livro: {exc}")
+            else:
+                if st.button("🗑️ Remover livro", key=f"delete_{r['id']}"):
+                    try:
+                        delete_book(conn, r["id"])
+                        conn.commit()
+                        st.warning("Livro removido.")
+                        st.rerun()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(f"Não foi possível remover o livro: {exc}")
 
 
 def show_loan_management(conn):

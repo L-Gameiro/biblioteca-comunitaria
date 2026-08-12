@@ -19,8 +19,10 @@ from sqlalchemy import text
 import app
 from app import (
     add_book,
+    count_loans_for_book,
     create_schema,
     create_user,
+    delete_book,
     generate_book_code,
     get_connection,
     get_engine,
@@ -343,3 +345,115 @@ def test_fluxo_completo_de_emprestimo_e_devolucao(conn):
 
     with pytest.raises(ValueError):
         return_loan(conn, active_loan["id"])
+
+
+# ---------------------------------------------------------------------------
+# delete_book — remoção de livro em Gestão de Livros
+# ---------------------------------------------------------------------------
+
+def _books_count(conn, book_id) -> int:
+    return conn.execute(
+        text("SELECT COUNT(*) AS n FROM books WHERE id = :id"), {"id": book_id}
+    ).mappings().first()["n"]
+
+
+def _loans_count_for(conn, book_id) -> int:
+    return conn.execute(
+        text("SELECT COUNT(*) AS n FROM loans WHERE book_id = :id"), {"id": book_id}
+    ).mappings().first()["n"]
+
+
+def test_delete_book_bloqueado_quando_ha_emprestimo_ativo(conn):
+    create_user(conn, "Leitor Um", "leitor.um@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor.um@teste.org")
+
+    code = add_book(conn, "Livro Emprestado", "Autor Um", "Categoria")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :code"), {"code": code}
+    ).mappings().first()
+
+    request_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="devolução"):
+        delete_book(conn, book["id"])
+
+    # nada foi apagado: livro e empréstimo ativo continuam intactos
+    assert _books_count(conn, book["id"]) == 1
+    assert _loans_count_for(conn, book["id"]) == 1
+
+
+def test_delete_book_com_historico_apenas_devolvido_remove_livro_e_loans(conn):
+    create_user(conn, "Leitor Dois", "leitor.dois@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor.dois@teste.org")
+
+    code = add_book(conn, "Livro Com Historico", "Autor Dois", "Categoria")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :code"), {"code": code}
+    ).mappings().first()
+
+    # dois ciclos de empréstimo/devolução -> 2 registros em loans, ambos devolvidos
+    for _ in range(2):
+        request_loan(conn, book["id"], leitor["id"])
+        conn.commit()
+        active = conn.execute(
+            text("SELECT * FROM loans WHERE book_id = :id AND status = 'ativo'"),
+            {"id": book["id"]},
+        ).mappings().first()
+        return_loan(conn, active["id"])
+        conn.commit()
+
+    assert count_loans_for_book(conn, book["id"]) == 2
+
+    delete_book(conn, book["id"])
+    conn.commit()
+
+    assert _books_count(conn, book["id"]) == 0
+    assert _loans_count_for(conn, book["id"]) == 0
+
+
+def test_delete_book_sem_historico_remove_direto(conn):
+    code = add_book(conn, "Livro Sem Historico", "Autor Tres", "Categoria")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :code"), {"code": code}
+    ).mappings().first()
+
+    assert count_loans_for_book(conn, book["id"]) == 0
+
+    delete_book(conn, book["id"])
+    conn.commit()
+
+    assert _books_count(conn, book["id"]) == 0
+
+
+def test_delete_book_e_atomico_rollback_desfaz_as_duas_exclusoes(conn):
+    create_user(conn, "Leitor Quatro", "leitor.quatro@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor.quatro@teste.org")
+
+    code = add_book(conn, "Livro Atomico", "Autor Quatro", "Categoria")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :code"), {"code": code}
+    ).mappings().first()
+
+    request_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+    active = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :id AND status = 'ativo'"),
+        {"id": book["id"]},
+    ).mappings().first()
+    return_loan(conn, active["id"])
+    conn.commit()
+
+    delete_book(conn, book["id"])  # ainda não commitado
+    conn.rollback()
+
+    # sem commit, o rollback desfaz as duas exclusões (livro + loans) juntas
+    assert _books_count(conn, book["id"]) == 1
+    assert _loans_count_for(conn, book["id"]) == 1
