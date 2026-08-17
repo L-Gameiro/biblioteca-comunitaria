@@ -508,7 +508,7 @@ def return_loan(conn, loan_id):
 # ---------------------------------------------------------------------------
 
 def show_auth_screen(conn):
-    st.title("📚 Biblioteca Comunitária")
+    st.title("Biblioteca Comunitária")
     tab_login, tab_cadastro = st.tabs(["Entrar", "Cadastrar-se"])
 
     with tab_login:
@@ -572,17 +572,21 @@ def show_catalog(conn, user):
     status_emoji = {"Disponível": "🟢", "Emprestado": "🔴", "Em Manutenção": "🟡"}
 
     for r in rows:
-        cols = st.columns([4, 3, 2, 2, 2])
-        cols[0].write(f"**{r['title']}**")
-        cols[1].write(r["author"])
-        cols[2].write(r["code"])
-        cols[3].write(f"{status_emoji.get(r['status'], '')} {r['status']}")
-        if user["role"] == "leitor" and r["status"] == "Disponível":
-            if cols[4].button("Pegar emprestado", key=f"borrow_{r['id']}"):
-                request_loan(conn, r["id"], user["id"])
-                conn.commit()
-                st.success(f'Empréstimo de "{r["title"]}" registrado!')
-                st.rerun()
+        with st.container(border=True):
+            info_col, action_col = st.columns([5, 2])
+            with info_col:
+                st.markdown(f"**{r['title']}**")
+                st.caption(f"{r['author']} · {r['code']}")
+                st.write(f"{status_emoji.get(r['status'], '')} {r['status']}")
+            with action_col:
+                if user["role"] == "leitor" and r["status"] == "Disponível":
+                    if st.button(
+                        "Pegar emprestado", key=f"borrow_{r['id']}", width="stretch"
+                    ):
+                        request_loan(conn, r["id"], user["id"])
+                        conn.commit()
+                        st.success(f'Empréstimo de "{r["title"]}" registrado!')
+                        st.rerun()
 
     if not rows:
         st.info("Nenhum livro encontrado.")
@@ -700,17 +704,20 @@ def show_loan_management(conn):
         st.info("Nenhum empréstimo ativo no momento.")
 
     for r in rows:
-        cols = st.columns([3, 2, 3, 2, 2, 2])
-        cols[0].write(f"**{r['title']}** ({r['code']})")
-        cols[1].write(r["full_name"])
-        cols[2].write(r["email"])
-        cols[3].write(r["phone"] or "-")
-        cols[4].write(f"Emprestado em {r['loan_date']}")
-        if cols[5].button("✅ Registrar devolução", key=f"return_{r['loan_id']}"):
-            return_loan(conn, r["loan_id"])
-            conn.commit()
-            st.success("Devolução registrada.")
-            st.rerun()
+        with st.container(border=True):
+            info_col, action_col = st.columns([5, 2])
+            with info_col:
+                st.markdown(f"**{r['title']}** ({r['code']})")
+                st.caption(f"{r['full_name']} · {r['email']} · {r['phone'] or '-'}")
+                st.write(f"Emprestado em {r['loan_date']}")
+            with action_col:
+                if st.button(
+                    "✅ Registrar devolução", key=f"return_{r['loan_id']}", width="stretch"
+                ):
+                    return_loan(conn, r["loan_id"])
+                    conn.commit()
+                    st.success("Devolução registrada.")
+                    st.rerun()
 
 
 def show_admin_loan_history(conn):
@@ -813,14 +820,19 @@ def show_my_loans(conn, user):
     if not active:
         st.info("Você não tem livros emprestados no momento.")
     for r in active:
-        cols = st.columns([4, 3, 3])
-        cols[0].write(f"**{r['title']}** ({r['code']})")
-        cols[1].write(f"Desde {r['loan_date']}")
-        if cols[2].button("Solicitar devolução", key=f"selfreturn_{r['loan_id']}"):
-            return_loan(conn, r["loan_id"])
-            conn.commit()
-            st.success("Devolução registrada. Obrigado!")
-            st.rerun()
+        with st.container(border=True):
+            info_col, action_col = st.columns([5, 2])
+            with info_col:
+                st.markdown(f"**{r['title']}** ({r['code']})")
+                st.caption(f"Desde {r['loan_date']}")
+            with action_col:
+                if st.button(
+                    "Solicitar devolução", key=f"selfreturn_{r['loan_id']}", width="stretch"
+                ):
+                    return_loan(conn, r["loan_id"])
+                    conn.commit()
+                    st.success("Devolução registrada. Obrigado!")
+                    st.rerun()
 
     st.subheader("Histórico completo")
     history = conn.execute(
@@ -834,11 +846,15 @@ def show_my_loans(conn, user):
         ),
         {"user_id": user["id"]},
     ).mappings().all()
+
+    if not history:
+        st.info("Nenhum empréstimo no histórico ainda.")
     for r in history:
-        st.write(
-            f"- **{r['title']}** ({r['code']}) — {r['loan_date']} → "
-            f"{r['return_date'] or 'em aberto'} [{r['status']}]"
-        )
+        with st.container(border=True):
+            st.markdown(f"**{r['title']}** ({r['code']})")
+            st.caption(
+                f"{r['loan_date']} → {r['return_date'] or 'em aberto'} · {r['status']}"
+            )
 
 
 def show_csv_import(conn):
@@ -944,8 +960,28 @@ def show_app(conn):
         show_csv_import(conn)
 
 
+def _inject_card_border_css() -> None:
+    """Tinge a borda de todo st.container(border=True) em vinho suave, no
+    lugar do cinza padrão do tema, sem competir com o vermelho sólido dos
+    botões primários."""
+    st.markdown(
+        """
+        <style>
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: rgba(122, 31, 43, 0.3) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
-    st.set_page_config(page_title="Biblioteca Comunitária", page_icon="📚", layout="wide")
+    st.set_page_config(
+        page_title="Biblioteca Comunitária", page_icon="assets/logo_cce.png", layout="wide"
+    )
+    st.logo("assets/logo_cce.png")
+    _inject_card_border_css()
     init_db()
 
     if "user" not in st.session_state:
