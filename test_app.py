@@ -18,6 +18,9 @@ from sqlalchemy import text
 
 import app
 from app import (
+    BookCodeAllocator,
+    CODE_STRATEGY_AUTHOR,
+    CODE_STRATEGY_NUMERIC,
     add_book,
     apply_column_mapping,
     count_loans_for_book,
@@ -26,12 +29,14 @@ from app import (
     delete_book,
     detect_column_mapping,
     generate_book_code,
+    get_code_strategy,
     get_connection,
     get_csv_columns,
     get_engine,
     get_user_by_email,
     init_db,
     is_valid_email,
+    max_numeric_code_for_category,
     normalize_status,
     parse_csv_bytes,
     process_import_rows,
@@ -666,3 +671,163 @@ def test_fluxo_completo_export_externo_mapeado_ate_a_gravacao(conn):
     assert saved["author"] == "Machado de Assis"
     assert saved["category"] == "Acervo CCE"
     assert saved["status"] == "Disponível"
+
+
+# ---------------------------------------------------------------------------
+# Estratégia de código por categoria (acervos Literária x Espiritual)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "category,expected",
+    [
+        ("Espiritual", CODE_STRATEGY_NUMERIC),
+        ("espiritual", CODE_STRATEGY_NUMERIC),
+        ("  ESPIRITUAL  ", CODE_STRATEGY_NUMERIC),
+        ("Literária", CODE_STRATEGY_AUTHOR),
+        ("Literaria", CODE_STRATEGY_AUTHOR),
+        ("Literatura Brasileira", CODE_STRATEGY_AUTHOR),  # categoria legada
+        ("", CODE_STRATEGY_AUTHOR),
+        (None, CODE_STRATEGY_AUTHOR),
+    ],
+)
+def test_get_code_strategy_depende_da_categoria(category, expected):
+    assert get_code_strategy(category) == expected
+
+
+def test_add_book_literaria_mantem_codigo_por_autor(conn):
+    code = add_book(conn, "Dom Casmurro", "Machado de Assis", "Literária")
+    conn.commit()
+    assert code == "ASSM-001"
+
+    code2 = add_book(conn, "Memórias Póstumas", "Machado de Assis", "Literária")
+    conn.commit()
+    assert code2 == "ASSM-002"
+
+
+def test_add_book_espiritual_gera_numerico_sequencial(conn):
+    assert max_numeric_code_for_category(conn, "Espiritual") == 0
+
+    first = add_book(conn, "O Livro dos Espíritos", "Allan Kardec", "Espiritual")
+    conn.commit()
+    assert first == "1"
+
+    second = add_book(conn, "O Evangelho Segundo o Espiritismo", "Allan Kardec", "Espiritual")
+    conn.commit()
+    assert second == "2"
+
+
+def test_numerico_continua_a_partir_do_maior_existente_sem_preencher_buracos(conn):
+    # base legada da Espiritual: 461 e 1091, com um buraco enorme no meio
+    for code, title in [("461", "Livro 461"), ("1091", "Livro 1091")]:
+        conn.execute(
+            text(
+                "INSERT INTO books (code, title, author, category, status, created_at) "
+                "VALUES (:code, :title, 'Autor Legado', 'Espiritual', 'Disponível', '2020-01-01')"
+            ),
+            {"code": code, "title": title},
+        )
+    conn.commit()
+
+    assert max_numeric_code_for_category(conn, "Espiritual") == 1091
+    # continua de 1091 -> 1092, não tenta reaproveitar 462
+    assert add_book(conn, "Novo Espiritual", "Autor Novo", "Espiritual") == "1092"
+
+
+def test_max_numerico_ignora_codigos_legados_fora_de_padrao_e_outras_categorias(conn):
+    rows = [
+        ("500", "Espiritual"),
+        ("BURE", "Espiritual"),        # legado sem número, não entra na sequência
+        ("9999", "Literária"),         # outra categoria, não conta
+    ]
+    for code, category in rows:
+        conn.execute(
+            text(
+                "INSERT INTO books (code, title, author, category, status, created_at) "
+                "VALUES (:code, 'T', 'A', :category, 'Disponível', '2020-01-01')"
+            ),
+            {"code": code, "category": category},
+        )
+    conn.commit()
+
+    assert max_numeric_code_for_category(conn, "Espiritual") == 500
+    assert add_book(conn, "Próximo", "Autor X", "Espiritual") == "501"
+
+
+def test_allocator_acumula_numerico_dentro_do_mesmo_lote(conn):
+    allocator = BookCodeAllocator(conn)
+    assert allocator.resolve_code("Autor A", "Espiritual") == "1"
+    assert allocator.resolve_code("Autor B", "Espiritual") == "2"
+    assert allocator.resolve_code("Autor C", "Espiritual") == "3"
+
+
+def test_allocator_nao_reemite_numero_ja_ocupado_por_codigo_explicito_do_lote(conn):
+    allocator = BookCodeAllocator(conn)
+    # linha traz código numérico explícito bem acima da sequência atual
+    assert allocator.resolve_code("Autor A", "Espiritual", "50") == "50"
+    # a próxima geração parte dele, em vez de colidir em "1"
+    assert allocator.resolve_code("Autor B", "Espiritual") == "51"
+
+
+def test_importacao_em_lote_mistura_as_duas_estrategias(conn):
+    rows = [
+        {"titulo": "Lit 1", "autor": "Machado de Assis", "categoria": "Literária"},
+        {"titulo": "Esp 1", "autor": "Allan Kardec", "categoria": "Espiritual"},
+        {"titulo": "Lit 2", "autor": "Machado de Assis", "categoria": "Literária"},
+        {"titulo": "Esp 2", "autor": "Chico Xavier", "categoria": "Espiritual"},
+        {"titulo": "Esp 3", "autor": "Allan Kardec", "categoria": "Espiritual"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    assert [p["codigo"] for p in processed] == ["ASSM-001", "1", "ASSM-002", "2", "3"]
+    assert summary == {"total": 5, "mantidos": 0, "gerados": 5, "com_erro": 0}
+
+
+def test_importacao_em_lote_considera_acervo_ja_existente_no_banco(conn):
+    add_book(conn, "Existente Lit", "Machado de Assis", "Literária")
+    add_book(conn, "Existente Esp", "Autor Esp", "Espiritual")
+    conn.commit()
+
+    rows = [
+        {"titulo": "Nova Lit", "autor": "Machado de Assis", "categoria": "Literária"},
+        {"titulo": "Nova Esp", "autor": "Outro Autor", "categoria": "Espiritual"},
+    ]
+    processed, _ = process_import_rows(conn, rows)
+    assert processed[0]["codigo"] == "ASSM-002"  # 1 no banco + 1
+    assert processed[1]["codigo"] == "2"         # maior numérico (1) + 1
+
+
+def test_importacao_preserva_codigos_legados_fora_de_padrao(conn):
+    """Os 13 códigos legados do acervo Literária entram como estão — sem
+    validação de formato, só de unicidade."""
+    legacy = ["BURE", "CUNM", "Bord-001", "GOMLI-001", "MACAL-001", "MILJ-001 (a)", "MILJ-001 (b)"]
+    rows = [
+        {"titulo": f"Livro {c}", "autor": f"Autor {i}", "categoria": "Literária", "codigo": c}
+        for i, c in enumerate(legacy)
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    assert [p["codigo"] for p in processed] == legacy
+    assert all(p["codigo_origem"] == "mantido" for p in processed)
+    assert summary["com_erro"] == 0
+
+    app.commit_import(conn, processed)
+    conn.commit()
+    saved = set(conn.execute(text("SELECT code FROM books")).scalars().all())
+    assert set(legacy).issubset(saved)
+
+
+def test_unicidade_continua_bloqueando_duplicatas_nas_duas_estrategias(conn):
+    add_book(conn, "Existente", "Autor Esp", "Espiritual")  # gera código "1"
+    conn.commit()
+
+    rows = [
+        {"titulo": "Dup banco", "autor": "X", "categoria": "Espiritual", "codigo": "1"},
+        {"titulo": "Dup lote A", "autor": "Y", "categoria": "Literária", "codigo": "ZZZ-001"},
+        {"titulo": "Dup lote B", "autor": "Z", "categoria": "Literária", "codigo": "ZZZ-001"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    assert any("Código duplicado" in e for e in processed[0]["erros"])  # contra o banco
+    assert processed[1]["erros"] == []
+    assert any("Código duplicado" in e for e in processed[2]["erros"])  # dentro do lote
+    assert summary["com_erro"] == 2

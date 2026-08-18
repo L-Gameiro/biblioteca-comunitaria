@@ -61,6 +61,14 @@ def _only_upper_letters(value: str) -> str:
     return re.sub(r"[^A-Z]", "", _strip_diacritics(value).upper())
 
 
+def _normalize_key(value: str) -> str:
+    """Chave de comparação tolerante: sem acento, minúscula e sem
+    separadores — 'Código-antigo', 'codigo antigo' e 'CODIGO_ANTIGO'
+    viram todos 'codigoantigo'; 'Espiritual' e ' espiritual ' viram
+    'espiritual'."""
+    return re.sub(r"[^a-z0-9]", "", _strip_diacritics(value or "").lower())
+
+
 def generate_book_code(
     author_full_name: str,
     existing_count_for_author: int,
@@ -270,6 +278,28 @@ def is_valid_email(email: str) -> bool:
 # Livros
 # ---------------------------------------------------------------------------
 
+# Acervos físicos do CCE. Cada um tem uma convenção de código própria, que
+# precisa ser preservada exatamente como está nas prateleiras.
+CATEGORY_LITERARIA = "Literária"
+CATEGORY_ESPIRITUAL = "Espiritual"
+BOOK_CATEGORIES = [CATEGORY_LITERARIA, CATEGORY_ESPIRITUAL]
+
+# Estratégias de geração de código.
+CODE_STRATEGY_AUTHOR = "autor"      # NETJ-001 (3 letras do sobrenome + inicial + seq)
+CODE_STRATEGY_NUMERIC = "numerico"  # 461, 1091 (sequencial puramente numérico)
+
+
+def get_code_strategy(category: str | None) -> str:
+    """Qual estratégia de código vale para uma categoria.
+
+    Acervo Espiritual usa numeração sequencial pura; qualquer outra categoria
+    (incluindo Literária e as categorias legadas) mantém a regra por autor.
+    A comparação ignora acento, caixa e espaços."""
+    if _normalize_key(category) == _normalize_key(CATEGORY_ESPIRITUAL):
+        return CODE_STRATEGY_NUMERIC
+    return CODE_STRATEGY_AUTHOR
+
+
 def count_books_by_author(conn, author: str) -> int:
     return conn.execute(
         text("SELECT COUNT(*) AS n FROM books WHERE author = :author"),
@@ -277,9 +307,72 @@ def count_books_by_author(conn, author: str) -> int:
     ).mappings().first()["n"]
 
 
+def max_numeric_code_for_category(conn, category: str) -> int:
+    """Maior código puramente numérico já usado na categoria (0 se não houver).
+
+    Códigos não numéricos da categoria são ignorados — a base legada tem
+    códigos fora de padrão que não participam da sequência numérica."""
+    target = _normalize_key(category)
+    rows = conn.execute(text("SELECT code, category FROM books")).mappings().all()
+    numbers = [
+        int(r["code"].strip())
+        for r in rows
+        if _normalize_key(r["category"]) == target and (r["code"] or "").strip().isdigit()
+    ]
+    return max(numbers, default=0)
+
+
+class BookCodeAllocator:
+    """Resolve o código de cada livro conforme a estratégia da sua categoria,
+    acumulando o que já foi alocado nesta instância.
+
+    Uma instância por lote: no cadastro manual é um livro só, na importação
+    CSV é o arquivo inteiro — assim o sequencial (por autor ou numérico)
+    considera tanto o que já está no banco quanto as linhas anteriores do
+    próprio lote.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._author_counts: dict[str, int] = {}
+        self._numeric_max: dict[str, int] = {}
+
+    def _numeric_base(self, category: str) -> int:
+        key = _normalize_key(category)
+        if key not in self._numeric_max:
+            self._numeric_max[key] = max_numeric_code_for_category(self._conn, category)
+        return self._numeric_max[key]
+
+    def resolve_code(self, author: str, category: str, code_in: str = "") -> str:
+        """Código final de uma linha: mantém o que veio preenchido (inclusive
+        os legados fora de padrão) ou gera conforme a estratégia da categoria.
+        Contabiliza a linha para as próximas do mesmo lote."""
+        code_in = (code_in or "").strip()
+        author = (author or "").strip()
+
+        if code_in:
+            final_code = code_in
+            # um código numérico já ocupado não pode ser reemitido adiante
+            if code_in.isdigit():
+                key = _normalize_key(category)
+                self._numeric_max[key] = max(self._numeric_base(category), int(code_in))
+        elif get_code_strategy(category) == CODE_STRATEGY_NUMERIC:
+            key = _normalize_key(category)
+            final_code = str(self._numeric_base(category) + 1)
+            self._numeric_max[key] = int(final_code)
+        elif author:
+            db_count = count_books_by_author(self._conn, author)
+            final_code = generate_book_code(author, db_count + self._author_counts.get(author, 0))
+        else:
+            final_code = ""
+
+        if author:
+            self._author_counts[author] = self._author_counts.get(author, 0) + 1
+        return final_code
+
+
 def add_book(conn, title, author, category):
-    existing = count_books_by_author(conn, author)
-    code = generate_book_code(author, existing)
+    code = BookCodeAllocator(conn).resolve_code(author, category)
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         text(
@@ -355,13 +448,6 @@ STATUS_SYNONYMS = {
     "Emprestado": ["emprestado", "borrowed", "on loan"],
     "Em Manutenção": ["em manutenção", "em manutencao", "manutenção", "manutencao"],
 }
-
-
-def _normalize_key(value: str) -> str:
-    """Chave de comparação tolerante: sem acento, minúscula e sem
-    separadores — 'Código-antigo', 'codigo antigo' e 'CODIGO_ANTIGO'
-    viram todos 'codigoantigo'."""
-    return re.sub(r"[^a-z0-9]", "", _strip_diacritics(value or "").lower())
 
 
 _NORMALIZED_FIELD_SYNONYMS = {
@@ -480,7 +566,7 @@ def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
     """
     existing_codes = set(conn.execute(text("SELECT code FROM books")).scalars().all())
     used_codes_in_batch: set[str] = set()
-    author_batch_counts: dict[str, int] = {}
+    allocator = BookCodeAllocator(conn)
 
     processed = []
     kept_count = 0
@@ -505,24 +591,16 @@ def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
             errors.append(f"Status inválido: '{status_in}'.")
         final_status = normalized_status or "Disponível"
 
-        final_code = ""
-        if code_in:
-            code_source = "mantido"
-            final_code = code_in
-            if final_code in existing_codes or final_code in used_codes_in_batch:
-                errors.append(f"Código duplicado: '{final_code}'.")
-        elif author:
-            code_source = "gerado"
-            db_count = count_books_by_author(conn, author)
-            batch_count = author_batch_counts.get(author, 0)
-            final_code = generate_book_code(author, db_count + batch_count)
-            if final_code in existing_codes or final_code in used_codes_in_batch:
-                errors.append(f"Colisão inesperada de código gerado: '{final_code}'.")
-        else:
-            code_source = "gerado"
+        code_source = "mantido" if code_in else "gerado"
+        final_code = allocator.resolve_code(author, category, code_in)
 
-        if author:
-            author_batch_counts[author] = author_batch_counts.get(author, 0) + 1
+        if final_code:
+            if code_source == "mantido":
+                if final_code in existing_codes or final_code in used_codes_in_batch:
+                    errors.append(f"Código duplicado: '{final_code}'.")
+            elif final_code in existing_codes or final_code in used_codes_in_batch:
+                errors.append(f"Colisão inesperada de código gerado: '{final_code}'.")
+
         if final_code:
             used_codes_in_batch.add(final_code)
 
@@ -712,15 +790,22 @@ def show_book_management(conn):
         with st.form("add_book_form"):
             title = st.text_input("Título")
             author = st.text_input("Autor (nome completo)")
-            category = st.text_input("Categoria")
+            category = st.selectbox(
+                "Categoria (acervo)",
+                BOOK_CATEGORIES,
+                help="A categoria determina a regra do código: Literária usa "
+                "sobrenome + inicial + sequencial (ex.: NETJ-001); Espiritual usa "
+                "numeração sequencial (ex.: 461).",
+            )
             if st.form_submit_button("Cadastrar livro"):
                 if not title or not author:
                     st.error("Título e autor são obrigatórios.")
                 else:
                     code = add_book(conn, title, author, category)
                     conn.commit()
-                    st.success(f"Livro cadastrado com código **{code}**")
-                    st.rerun()
+                    st.success(
+                        f'Livro cadastrado no acervo **{category}** com código **{code}**'
+                    )
 
     st.subheader("Livros cadastrados")
     statuses = ["Disponível", "Emprestado", "Em Manutenção"]

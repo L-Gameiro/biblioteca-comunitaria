@@ -120,11 +120,44 @@ Os testes usam **SQLite local descartável através da mesma camada
 SQLAlchemy** usada em produção (um arquivo temporário por teste, limpo
 automaticamente pelo pytest) — não dependem de acesso de rede ao Supabase.
 Cobrem: a geração de código de livro (`generate_book_code`, mesmos casos de
-borda do `bookCode.test.ts`), a lógica de importação em lote via CSV
+borda do `bookCode.test.ts`), a estratégia de código por acervo
+(`get_code_strategy`, `BookCodeAllocator`), a lógica de importação em lote via CSV
 (`parse_csv_bytes`, `process_import_rows`), o mapeamento flexível de colunas
 (`detect_column_mapping`, `apply_column_mapping`, `normalize_status`),
 inicialização do schema/seed (`init_db`), o fluxo de empréstimo/devolução e a
 remoção de livros (`delete_book`).
+
+## Código do livro por acervo
+
+O CCE tem dois acervos físicos com convenções de código diferentes, e ambas
+precisam ser preservadas exatamente como estão nas prateleiras. A categoria do
+livro determina qual regra vale:
+
+| Categoria | Estratégia | Formato | Exemplo |
+|---|---|---|---|
+| **Literária** (e qualquer outra categoria) | por autor | 3 primeiras letras do último token do nome + inicial do primeiro nome + sequencial de 3 dígitos daquele autor | `NETJ-001` |
+| **Espiritual** | numérica | próximo inteiro livre da sequência da categoria (maior número existente + 1) | `461`, `1091` |
+
+Detalhes:
+
+- A escolha da estratégia fica em `get_code_strategy(categoria)`; a alocação
+  (incluindo o acúmulo dentro de um lote de importação) fica em
+  `BookCodeAllocator`. A comparação da categoria ignora acento, caixa e
+  espaços, então `Espiritual`, `espiritual` e ` ESPIRITUAL ` são equivalentes.
+- A sequência numérica **não preenche buracos**: se a categoria já tem `461` e
+  `1091`, o próximo é `1092`, não `462`.
+- Códigos não numéricos dentro da Espiritual (legados) são ignorados no
+  cálculo do maior número, mas continuam válidos no acervo.
+- No cadastro manual (**Gestão de Livros**), Categoria é um selectbox com os
+  dois acervos, e o código gerado é exibido na confirmação.
+
+### Códigos legados fora de padrão
+
+A base real do CCE tem 13 códigos legados no acervo Literária que fogem do
+formato (`BURE` e `CUNM` sem número, `Bord-001` em minúsculas, `GOMLI-001` e
+`MACAL-001` com 5 letras, `MILJ-001 (a)` e `MILJ-001 (b)` com sufixo manual).
+Eles são válidos e entram sem alteração: **a importação não valida formato de
+código, apenas unicidade** — contra o banco e dentro do próprio arquivo.
 
 ## Importação de livros via CSV
 
@@ -152,7 +185,7 @@ oferece um selectbox com as colunas disponíveis mais a opção
 | `titulo` | **sim** | — (bloqueia o avanço) |
 | `autor` | **sim** | — (bloqueia o avanço) |
 | `categoria` | não | Fica vazia, ou recebe a *categoria fixa* (veja abaixo) |
-| `codigo` | não | Código gerado automaticamente por `generate_book_code`, considerando os livros do mesmo autor já no banco somados aos já processados em linhas anteriores do arquivo |
+| `codigo` | não | Código gerado automaticamente conforme a **estratégia da categoria** daquela linha (veja *Código do livro por acervo*), acumulando dentro do próprio lote |
 | `status` | não | Assume `Disponível` |
 
 **Detecção automática:** os selectboxes já vêm pré-selecionados comparando os
