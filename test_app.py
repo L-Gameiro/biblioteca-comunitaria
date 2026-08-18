@@ -297,7 +297,7 @@ def test_resumo_estatistico_mistura_mantidos_gerados_e_erros(conn):
 # Camada de banco (SQLAlchemy) — init_db, engine/conexão, empréstimos
 # ---------------------------------------------------------------------------
 
-def test_init_db_cria_schema_admin_e_seed_de_forma_idempotente(tmp_path):
+def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
     database_url = f"sqlite:///{tmp_path}/init.db"
     init_db(database_url)
     init_db(database_url)  # chamado 2x, como acontece a cada rerun do Streamlit
@@ -309,9 +309,42 @@ def test_init_db_cria_schema_admin_e_seed_de_forma_idempotente(tmp_path):
         assert verify_password("admin123", admin["password_hash"], admin["salt"])
 
         user_count = connection.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"]
-        book_count = connection.execute(text("SELECT COUNT(*) AS n FROM books")).mappings().first()["n"]
         assert user_count == 1  # não duplicou o admin na 2ª chamada
-        assert book_count == 4  # não duplicou a carga inicial de livros
+
+
+def test_init_db_nao_insere_livros_de_exemplo(tmp_path):
+    """O catálogo começa vazio: os livros vêm da carga real do acervo, e um
+    seed automático colidiria com códigos reais do cliente (ASSM-001 etc.)."""
+    database_url = f"sqlite:///{tmp_path}/init_sem_seed.db"
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        book_count = connection.execute(
+            text("SELECT COUNT(*) AS n FROM books")
+        ).mappings().first()["n"]
+        assert book_count == 0
+
+
+def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path):
+    """Reiniciar o app (init_db de novo, com engine novo) não pode repor
+    livros — nem os de exemplo, nem repetir a carga real já existente."""
+    database_url = f"sqlite:///{tmp_path}/init_reinicio.db"
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        add_book(connection, "Livro Real do Acervo", "Machado de Assis", "Literária")
+        connection.commit()
+
+    # simula um restart: limpa o cache de engines já inicializados
+    app._initialized_engine_ids.clear()
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        rows = connection.execute(
+            text("SELECT code, title FROM books ORDER BY id")
+        ).mappings().all()
+        assert [r["title"] for r in rows] == ["Livro Real do Acervo"]
+        assert rows[0]["code"] == "ASSM-001"  # código real do cliente preservado
 
 
 def test_get_connection_sem_database_url_levanta_erro_claro(monkeypatch):

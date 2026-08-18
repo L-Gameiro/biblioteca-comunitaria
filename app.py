@@ -208,21 +208,13 @@ def init_db(database_url: str | None = None) -> None:
 
     create_schema(engine)
     with get_connection(database_url) as conn:
+        # Só o admin padrão é criado automaticamente — necessário para o
+        # primeiro acesso. O catálogo começa vazio: os livros vêm da carga
+        # real do acervo (cadastro manual ou importação de CSV).
         if conn.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"] == 0:
             create_user(
                 conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin"
             )
-            conn.commit()
-
-        if conn.execute(text("SELECT COUNT(*) AS n FROM books")).mappings().first()["n"] == 0:
-            seed = [
-                ("Dom Casmurro", "Machado de Assis", "Literatura Brasileira"),
-                ("Grande Sertão: Veredas", "João Guimarães Rosa", "Literatura Brasileira"),
-                ("Memórias Póstumas de Brás Cubas", "Machado de Assis", "Literatura Brasileira"),
-                ("Vidas Secas", "Graciliano Ramos", "Literatura Brasileira"),
-            ]
-            for title, author, category in seed:
-                add_book(conn, title, author, category)
             conn.commit()
 
     _initialized_engine_ids.add(id(engine))

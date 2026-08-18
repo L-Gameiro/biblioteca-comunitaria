@@ -72,8 +72,9 @@ streamlit run app.py
 ```
 
 Na primeira execução, o schema (`users`, `books`, `loans`) é criado
-automaticamente no Postgres, junto com o usuário administrador padrão e uma
-carga inicial de livros de exemplo.
+automaticamente no Postgres, junto com o usuário administrador padrão. O
+catálogo começa **vazio**: os livros entram pela carga real do acervo, seja
+pelo cadastro manual (**Gestão de Livros**) ou pela **Importação via CSV**.
 
 ### Credenciais do administrador padrão
 
@@ -124,7 +125,8 @@ borda do `bookCode.test.ts`), a estratégia de código por acervo
 (`get_code_strategy`, `BookCodeAllocator`), a lógica de importação em lote via CSV
 (`parse_csv_bytes`, `process_import_rows`), o mapeamento flexível de colunas
 (`detect_column_mapping`, `apply_column_mapping`, `normalize_status`),
-inicialização do schema/seed (`init_db`), o fluxo de empréstimo/devolução e a
+inicialização do schema e do admin padrão (`init_db`), o fluxo de
+empréstimo/devolução e a
 remoção de livros (`delete_book`).
 
 ## Código do livro por acervo
