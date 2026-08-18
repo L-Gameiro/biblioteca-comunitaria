@@ -19,16 +19,20 @@ from sqlalchemy import text
 import app
 from app import (
     add_book,
+    apply_column_mapping,
     count_loans_for_book,
     create_schema,
     create_user,
     delete_book,
+    detect_column_mapping,
     generate_book_code,
     get_connection,
+    get_csv_columns,
     get_engine,
     get_user_by_email,
     init_db,
     is_valid_email,
+    normalize_status,
     parse_csv_bytes,
     process_import_rows,
     request_loan,
@@ -457,3 +461,208 @@ def test_delete_book_e_atomico_rollback_desfaz_as_duas_exclusoes(conn):
     # sem commit, o rollback desfaz as duas exclusões (livro + loans) juntas
     assert _books_count(conn, book["id"]) == 1
     assert _loans_count_for(conn, book["id"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Mapeamento flexível de colunas (importação de exports de outras ferramentas)
+# ---------------------------------------------------------------------------
+
+def test_deteccao_automatica_ignora_acentos_e_caixa():
+    columns = get_csv_columns(
+        parse_csv_bytes("TÍTULO;Autor;Categoria;Situação\nA;B;C;\n".encode("utf-8"))
+    )
+    mapping, ambiguities = detect_column_mapping(columns)
+    assert mapping["titulo"] == "título"
+    assert mapping["autor"] == "autor"
+    assert mapping["categoria"] == "categoria"
+    assert mapping["status"] == "situação"
+    assert mapping["codigo"] is None  # nenhuma coluna candidata no arquivo
+    assert ambiguities == {}
+
+
+def test_deteccao_automatica_aceita_sinonimos_em_ingles_e_variantes():
+    columns = ["Nome", "Escritor", "Acervo", "Tombo", "status"]
+    mapping, ambiguities = detect_column_mapping(columns)
+    assert mapping == {
+        "titulo": "Nome",
+        "autor": "Escritor",
+        "categoria": "Acervo",
+        "codigo": "Tombo",
+        "status": "status",
+    }
+    assert ambiguities == {}
+
+
+def test_duas_colunas_candidatas_ao_mesmo_campo_sinalizam_ambiguidade():
+    # export real do CCE: 'Código-antigo' E 'Código' no mesmo arquivo
+    columns = ["Título", "Autor", "Código-antigo", "Código"]
+    mapping, ambiguities = detect_column_mapping(columns)
+
+    # não escolhe sozinho: deixa sem pré-seleção e reporta as candidatas
+    assert mapping["codigo"] is None
+    assert ambiguities["codigo"] == ["Código-antigo", "Código"]
+    # campos não ambíguos seguem detectados normalmente
+    assert mapping["titulo"] == "Título"
+    assert mapping["autor"] == "Autor"
+
+
+def test_mapeamento_manual_sobrescreve_a_deteccao_automatica():
+    # 'denominacao' não é sinônimo conhecido, então a detecção escolhe 'título'
+    rows = [{"título": "Ignorado", "autor": "Autor X", "denominacao": "Título Real"}]
+    columns = get_csv_columns(rows)
+    detected, _ = detect_column_mapping(columns)
+    assert detected["titulo"] == "título"
+
+    # usuário sobrescreve para a coluna 'denominacao'
+    manual = dict(detected)
+    manual["titulo"] = "denominacao"
+    mapped = apply_column_mapping(rows, manual)
+    assert mapped[0]["titulo"] == "Título Real"
+    assert mapped[0]["autor"] == "Autor X"
+
+
+def test_colunas_sinonimas_do_mesmo_campo_tambem_geram_ambiguidade():
+    # 'título' e 'obra' são ambos sinônimos de titulo -> usuário decide
+    columns = ["título", "obra", "autor"]
+    mapping, ambiguities = detect_column_mapping(columns)
+    assert mapping["titulo"] is None
+    assert ambiguities["titulo"] == ["título", "obra"]
+
+
+def test_campos_nao_mapeados_saem_vazios():
+    rows = [{"nome": "Livro A", "escritor": "Autor A", "extra": "irrelevante"}]
+    mapping = {"titulo": "nome", "autor": "escritor", "categoria": None, "codigo": None, "status": None}
+    mapped = apply_column_mapping(rows, mapping)
+    assert mapped[0] == {
+        "titulo": "Livro A",
+        "autor": "Autor A",
+        "categoria": "",
+        "codigo": "",
+        "status": "",
+    }
+
+
+def test_categoria_fixa_aplicada_a_todas_as_linhas():
+    rows = [
+        {"titulo": "Livro A", "autor": "Autor A"},
+        {"titulo": "Livro B", "autor": "Autor B"},
+    ]
+    mapping = {"titulo": "titulo", "autor": "autor", "categoria": None, "codigo": None, "status": None}
+    mapped = apply_column_mapping(rows, mapping, fixed_category="  Acervo Infantil  ")
+    assert [m["categoria"] for m in mapped] == ["Acervo Infantil", "Acervo Infantil"]
+
+
+def test_categoria_da_coluna_tem_precedencia_sobre_categoria_fixa():
+    rows = [{"titulo": "Livro A", "autor": "Autor A", "categoria": "Poesia"}]
+    mapping = {
+        "titulo": "titulo",
+        "autor": "autor",
+        "categoria": "categoria",
+        "codigo": None,
+        "status": None,
+    }
+    mapped = apply_column_mapping(rows, mapping, fixed_category="Acervo Geral")
+    assert mapped[0]["categoria"] == "Poesia"
+
+
+def test_apply_column_mapping_faz_strip_dos_espacos_sobrando():
+    rows = [
+        {
+            "titulo": "  Dom Casmurro  ",
+            "autor": "  Machado de Assis ",
+            "categoria": " Romance ",
+            "codigo": "  ABC-001 ",
+        }
+    ]
+    mapping = {
+        "titulo": "titulo",
+        "autor": "autor",
+        "categoria": "categoria",
+        "codigo": "codigo",
+        "status": None,
+    }
+    mapped = apply_column_mapping(rows, mapping)
+    assert mapped[0]["titulo"] == "Dom Casmurro"
+    assert mapped[0]["autor"] == "Machado de Assis"
+    assert mapped[0]["categoria"] == "Romance"
+    assert mapped[0]["codigo"] == "ABC-001"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Disponível", "Disponível"),
+        ("disponivel", "Disponível"),
+        ("available", "Disponível"),
+        ("Emprestado", "Emprestado"),
+        ("emprestado", "Emprestado"),
+        ("borrowed", "Emprestado"),
+        ("on loan", "Emprestado"),
+        ("On Loan", "Emprestado"),
+        ("Em Manutenção", "Em Manutenção"),
+        ("em manutencao", "Em Manutenção"),
+        ("manutenção", "Em Manutenção"),
+        ("", "Disponível"),
+        ("   ", "Disponível"),
+        (None, "Disponível"),
+    ],
+)
+def test_normalize_status_aceita_variacoes_conhecidas(raw, expected):
+    assert normalize_status(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["Perdido", "extraviado", "qualquer coisa", "0"])
+def test_normalize_status_retorna_none_para_valor_desconhecido(raw):
+    assert normalize_status(raw) is None
+
+
+def test_status_normalizado_no_preview_e_erro_para_desconhecido(conn):
+    rows = [
+        {"titulo": "Livro A", "autor": "Autor A", "status": "available"},
+        {"titulo": "Livro B", "autor": "Autor B", "status": "on loan"},
+        {"titulo": "Livro C", "autor": "Autor C", "status": "em manutencao"},
+        {"titulo": "Livro D", "autor": "Autor D", "status": "Extraviado"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+    assert processed[0]["status"] == "Disponível"
+    assert processed[1]["status"] == "Emprestado"
+    assert processed[2]["status"] == "Em Manutenção"
+    assert any("Status inválido" in e for e in processed[3]["erros"])
+    assert summary["com_erro"] == 1
+
+
+def test_fluxo_completo_export_externo_mapeado_ate_a_gravacao(conn):
+    """Export no estilo Memento: cabeçalhos diferentes, espaços sobrando,
+    status em inglês e uma coluna de código legado fora de padrão."""
+    csv_bytes = (
+        "Nome;Escritor;Situação;Tombo\n"
+        "  Dom Casmurro  ;  Machado de Assis ;available;  L-0001 \n"
+        "Vidas Secas;Graciliano Ramos;on loan;L-0002\n"
+    ).encode("utf-8-sig")
+
+    raw_rows = parse_csv_bytes(csv_bytes)
+    columns = get_csv_columns(raw_rows)
+    mapping, ambiguities = detect_column_mapping(columns)
+    assert ambiguities == {}
+
+    mapped = apply_column_mapping(raw_rows, mapping, fixed_category="Acervo CCE")
+    processed, summary = process_import_rows(conn, mapped)
+
+    assert summary == {"total": 2, "mantidos": 2, "gerados": 0, "com_erro": 0}
+    assert processed[0]["titulo"] == "Dom Casmurro"
+    assert processed[0]["autor"] == "Machado de Assis"
+    assert processed[0]["categoria"] == "Acervo CCE"
+    assert processed[0]["codigo"] == "L-0001"  # código legado mantido como veio
+    assert processed[0]["status"] == "Disponível"
+    assert processed[1]["status"] == "Emprestado"
+
+    app.commit_import(conn, processed)
+    conn.commit()
+
+    saved = conn.execute(
+        text("SELECT * FROM books WHERE code = :code"), {"code": "L-0001"}
+    ).mappings().first()
+    assert saved["title"] == "Dom Casmurro"
+    assert saved["author"] == "Machado de Assis"
+    assert saved["category"] == "Acervo CCE"
+    assert saved["status"] == "Disponível"

@@ -121,33 +121,104 @@ SQLAlchemy** usada em produção (um arquivo temporário por teste, limpo
 automaticamente pelo pytest) — não dependem de acesso de rede ao Supabase.
 Cobrem: a geração de código de livro (`generate_book_code`, mesmos casos de
 borda do `bookCode.test.ts`), a lógica de importação em lote via CSV
-(`parse_csv_bytes`, `process_import_rows`), inicialização do schema/seed
-(`init_db`) e o fluxo de empréstimo/devolução.
+(`parse_csv_bytes`, `process_import_rows`), o mapeamento flexível de colunas
+(`detect_column_mapping`, `apply_column_mapping`, `normalize_status`),
+inicialização do schema/seed (`init_db`), o fluxo de empréstimo/devolução e a
+remoção de livros (`delete_book`).
 
 ## Importação de livros via CSV
 
-Na tela **Importar CSV** (menu do administrador), envie um arquivo com
-cabeçalho na primeira linha e as colunas:
+Na tela **Importar CSV** (menu do administrador). O arquivo **não precisa vir
+no formato interno** — exports de outras ferramentas (Memento Database, por
+exemplo) são aceitos diretamente, porque você escolhe na tela qual coluna do
+arquivo corresponde a cada campo.
 
-| Coluna | Obrigatória | Descrição |
+O fluxo tem três passos: **upload → mapeamento de colunas → pré-visualização
+e confirmação**.
+
+### 1. Upload
+
+Basta que o arquivo tenha cabeçalho na primeira linha. Delimitador `,` ou `;`
+e encoding UTF-8 (com ou sem BOM) são detectados automaticamente.
+
+### 2. Mapeamento de colunas
+
+A tela lista as colunas encontradas no arquivo e, para cada campo interno,
+oferece um selectbox com as colunas disponíveis mais a opção
+`(não mapear / deixar vazio)`:
+
+| Campo interno | Obrigatório | Quando não mapeado |
 |---|---|---|
-| `titulo` | sim | Título do livro |
-| `autor` | sim | Nome completo do autor |
-| `categoria` | não | Categoria/gênero |
-| `codigo` | não | Se informado, é usado exatamente como está (deve ser único). Se vazio, é gerado automaticamente pela mesma regra de `generate_book_code`, considerando os livros do mesmo autor já no banco somados aos já processados em linhas anteriores do arquivo. |
-| `status` | não | Um de `Disponível`, `Emprestado`, `Em Manutenção`. Se vazio, assume `Disponível`. |
+| `titulo` | **sim** | — (bloqueia o avanço) |
+| `autor` | **sim** | — (bloqueia o avanço) |
+| `categoria` | não | Fica vazia, ou recebe a *categoria fixa* (veja abaixo) |
+| `codigo` | não | Código gerado automaticamente por `generate_book_code`, considerando os livros do mesmo autor já no banco somados aos já processados em linhas anteriores do arquivo |
+| `status` | não | Assume `Disponível` |
 
-- Delimitador `,` ou `;` e encoding UTF-8 (com ou sem BOM) são detectados
-  automaticamente.
-- Antes de gravar no banco, a tela mostra uma **pré-visualização** com o
-  resumo do lote (total de registros, códigos mantidos, códigos gerados,
-  linhas com erro) e destaca linhas com erros bloqueantes: título ou autor
-  vazios, status inválido, ou código duplicado (contra o banco ou entre
+**Detecção automática:** os selectboxes já vêm pré-selecionados comparando os
+nomes das colunas de forma tolerante (sem acento, sem diferenciar maiúsculas
+e ignorando espaços, hífens e `_`). Sinônimos reconhecidos:
+
+| Campo | Sinônimos |
+|---|---|
+| `titulo` | titulo, título, title, nome, obra |
+| `autor` | autor, author, escritor |
+| `categoria` | categoria, category, acervo, colecao, coleção |
+| `codigo` | codigo, código, código-antigo, code, cod, tombo, registro |
+| `status` | status, situacao, situação |
+
+Qualquer pré-seleção pode ser sobrescrita manualmente.
+
+**Ambiguidade:** quando mais de uma coluna do arquivo é candidata ao mesmo
+campo (o export real do CCE traz `Código-antigo` **e** `Código`, com
+significados diferentes), o sistema **não escolhe sozinho** — exibe um aviso
+listando as candidatas e deixa o campo sem pré-seleção, para você decidir.
+
+**Categoria fixa:** quando nenhuma coluna de categoria é mapeada, aparece um
+campo para informar uma categoria única aplicada a todas as linhas — útil
+quando o arquivo inteiro pertence a um só acervo.
+
+### 3. Pré-visualização e confirmação
+
+Antes de gravar no banco, a tela mostra:
+
+- **Resumo do lote**: total de registros, códigos mantidos, códigos gerados e
+  linhas com erro.
+- **Tabela de inconsistências** destacando erros bloqueantes: título ou autor
+  vazios, status desconhecido, ou código duplicado (contra o banco ou entre
   linhas do próprio arquivo).
-- O botão **Confirmar importação** fica desabilitado enquanto houver
-  qualquer erro bloqueante no lote.
+- O botão **Confirmar importação** fica desabilitado enquanto houver qualquer
+  erro bloqueante no lote.
 
-Exemplo de CSV válido:
+### Tratamento dos valores
+
+- **Espaços sobrando** são removidos (`.strip()`) de `titulo`, `autor`,
+  `categoria` e `codigo` — evita autores e categorias duplicados por uma
+  diferença invisível.
+- **Status** aceita variações comuns e normaliza para os valores internos:
+
+  | Valor no arquivo | Vira |
+  |---|---|
+  | `Disponível`, `disponivel`, `available` | `Disponível` |
+  | `Emprestado`, `emprestado`, `borrowed`, `on loan` | `Emprestado` |
+  | `Em Manutenção`, `em manutencao`, `manutenção` | `Em Manutenção` |
+  | vazio | `Disponível` |
+  | qualquer outro | **erro bloqueante** na linha (nunca adivinhamos) |
+
+- **Códigos legados são preservados como estão.** Não há validação de formato
+  de código: a base legada do CCE tem códigos fora do padrão e eles devem ser
+  importados exatamente como vieram.
+
+Exemplo de export externo aceito (cabeçalhos diferentes, `;`, status em
+inglês, espaços sobrando):
+
+```csv
+Nome;Escritor;Acervo;Código;Situação
+  Dom Casmurro  ;  Machado de Assis ;Literatura;L-0001;available
+Vidas Secas;Graciliano Ramos;Literatura;L-0002;on loan
+```
+
+Exemplo já no formato interno (detectado automaticamente, sem ajuste manual):
 
 ```csv
 titulo,autor,categoria,codigo,status

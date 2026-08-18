@@ -334,6 +334,113 @@ def delete_book(conn, book_id) -> None:
 
 VALID_BOOK_STATUSES = {"Disponível", "Emprestado", "Em Manutenção"}
 
+# Campos internos que a importação sabe preencher, na ordem em que aparecem
+# na tela de mapeamento. titulo/autor são obrigatórios; o resto é opcional.
+IMPORT_FIELDS = ["titulo", "autor", "categoria", "codigo", "status"]
+REQUIRED_IMPORT_FIELDS = ["titulo", "autor"]
+
+# Sinônimos aceitos para detecção automática de colunas. A comparação é
+# tolerante: sem acento, sem caixa e sem separadores (espaço, hífen, _).
+IMPORT_FIELD_SYNONYMS = {
+    "titulo": ["titulo", "título", "title", "nome", "obra"],
+    "autor": ["autor", "author", "escritor"],
+    "categoria": ["categoria", "category", "acervo", "colecao", "coleção"],
+    "codigo": ["codigo", "código", "código-antigo", "code", "cod", "tombo", "registro"],
+    "status": ["status", "situacao", "situação"],
+}
+
+# Variações aceitas para cada status interno (normalizadas por _normalize_key).
+STATUS_SYNONYMS = {
+    "Disponível": ["disponível", "disponivel", "available"],
+    "Emprestado": ["emprestado", "borrowed", "on loan"],
+    "Em Manutenção": ["em manutenção", "em manutencao", "manutenção", "manutencao"],
+}
+
+
+def _normalize_key(value: str) -> str:
+    """Chave de comparação tolerante: sem acento, minúscula e sem
+    separadores — 'Código-antigo', 'codigo antigo' e 'CODIGO_ANTIGO'
+    viram todos 'codigoantigo'."""
+    return re.sub(r"[^a-z0-9]", "", _strip_diacritics(value or "").lower())
+
+
+_NORMALIZED_FIELD_SYNONYMS = {
+    field: {_normalize_key(s) for s in synonyms}
+    for field, synonyms in IMPORT_FIELD_SYNONYMS.items()
+}
+
+_NORMALIZED_STATUS_SYNONYMS = {
+    _normalize_key(variant): canonical
+    for canonical, variants in STATUS_SYNONYMS.items()
+    for variant in variants
+}
+
+
+def normalize_status(value: str | None) -> str | None:
+    """Normaliza um valor de status vindo do CSV para um dos status internos.
+
+    Vazio -> 'Disponível' (padrão). Valor desconhecido -> None, para que o
+    chamador registre erro bloqueante na linha (nunca adivinhamos)."""
+    raw = (value or "").strip()
+    if not raw:
+        return "Disponível"
+    return _NORMALIZED_STATUS_SYNONYMS.get(_normalize_key(raw))
+
+
+def detect_column_mapping(columns: list[str]) -> tuple[dict, dict]:
+    """Pré-seleciona, para cada campo interno, qual coluna do arquivo parece
+    corresponder a ele.
+
+    Retorna (mapeamento, ambiguidades):
+      - mapeamento: campo -> coluna do arquivo (ou None se não detectado)
+      - ambiguidades: campo -> lista de colunas candidatas, quando houver mais
+        de uma. Nesse caso o campo fica SEM pré-seleção de propósito: a escolha
+        é do usuário (o export real do CCE traz 'Código-antigo' e 'Código'
+        no mesmo arquivo, com significados diferentes).
+    """
+    mapping: dict[str, str | None] = {field: None for field in IMPORT_FIELDS}
+    ambiguities: dict[str, list[str]] = {}
+
+    for field in IMPORT_FIELDS:
+        candidates = [
+            column
+            for column in columns
+            if _normalize_key(column) in _NORMALIZED_FIELD_SYNONYMS[field]
+        ]
+        if len(candidates) == 1:
+            mapping[field] = candidates[0]
+        elif len(candidates) > 1:
+            ambiguities[field] = candidates
+
+    return mapping, ambiguities
+
+
+def apply_column_mapping(
+    rows: list[dict], mapping: dict, fixed_category: str = ""
+) -> list[dict]:
+    """Converte as linhas cruas do CSV para o formato interno
+    (titulo/autor/categoria/codigo/status), conforme o mapeamento escolhido.
+
+    Campos não mapeados saem vazios — o processamento posterior aplica o
+    comportamento padrão (código gerado, status 'Disponível'). Uma categoria
+    fixa, quando informada, vale para todas as linhas e dispensa mapear uma
+    coluna de categoria. Todos os valores saem com .strip() aplicado, porque o
+    export real traz espaços sobrando que gerariam autores/categorias
+    duplicados por diferença invisível.
+    """
+    fixed_category = (fixed_category or "").strip()
+    mapped_rows = []
+    for row in rows:
+        mapped = {}
+        for field in IMPORT_FIELDS:
+            column = mapping.get(field)
+            value = row.get(column) if column else None
+            mapped[field] = (value or "").strip()
+        if fixed_category and not mapped["categoria"]:
+            mapped["categoria"] = fixed_category
+        mapped_rows.append(mapped)
+    return mapped_rows
+
 
 def parse_csv_bytes(data: bytes) -> list[dict]:
     """Decodifica bytes de um CSV (UTF-8 com ou sem BOM) e detecta o
@@ -356,6 +463,11 @@ def parse_csv_bytes(data: bytes) -> list[dict]:
         {(key or "").strip().lower(): value for key, value in row.items()}
         for row in reader
     ]
+
+
+def get_csv_columns(rows: list[dict]) -> list[str]:
+    """Nomes das colunas do arquivo, na ordem em que aparecem no cabeçalho."""
+    return list(rows[0].keys()) if rows else []
 
 
 def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
@@ -388,9 +500,10 @@ def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
         if not author:
             errors.append("Autor é obrigatório.")
 
-        if status_in and status_in not in VALID_BOOK_STATUSES:
+        normalized_status = normalize_status(status_in)
+        if normalized_status is None:
             errors.append(f"Status inválido: '{status_in}'.")
-        final_status = status_in if status_in in VALID_BOOK_STATUSES else "Disponível"
+        final_status = normalized_status or "Disponível"
 
         final_code = ""
         if code_in:
@@ -860,30 +973,80 @@ def show_my_loans(conn, user):
 def show_csv_import(conn):
     st.header("Importar carga de livros (CSV)")
     st.caption(
-        "Colunas aceitas (cabeçalho na 1ª linha): **titulo**, **autor**, **categoria**, "
-        "**codigo** (opcional), **status** (opcional — Disponível/Emprestado/Em Manutenção). "
-        "Delimitador `,` ou `;` e encoding UTF-8 (com ou sem BOM) são detectados automaticamente."
+        "O arquivo **não precisa** vir no formato interno: depois do upload você "
+        "escolhe qual coluna do arquivo corresponde a cada campo. Delimitador `,` ou "
+        "`;` e encoding UTF-8 (com ou sem BOM) são detectados automaticamente."
     )
     uploaded = st.file_uploader("Selecione o arquivo CSV", type=["csv"])
 
     if uploaded is None:
-        for key in ("csv_import_processed", "csv_import_summary", "csv_import_filename"):
+        for key in ("csv_import_rows", "csv_import_filename"):
             st.session_state.pop(key, None)
         return
 
     if st.session_state.get("csv_import_filename") != uploaded.name:
         try:
-            rows = parse_csv_bytes(uploaded.getvalue())
+            st.session_state.csv_import_rows = parse_csv_bytes(uploaded.getvalue())
         except (UnicodeDecodeError, csv.Error) as exc:
             st.error(f"Não foi possível ler o arquivo CSV: {exc}")
             return
-        processed, summary = process_import_rows(conn, rows)
-        st.session_state.csv_import_processed = processed
-        st.session_state.csv_import_summary = summary
         st.session_state.csv_import_filename = uploaded.name
 
-    processed = st.session_state.csv_import_processed
-    summary = st.session_state.csv_import_summary
+    raw_rows = st.session_state.csv_import_rows
+    columns = get_csv_columns(raw_rows)
+
+    if not raw_rows:
+        st.warning("O arquivo não contém nenhuma linha de dados.")
+        return
+
+    st.subheader("Mapeamento de colunas")
+    st.write(
+        f"**{len(raw_rows)}** linha(s) e **{len(columns)}** coluna(s) encontrada(s): "
+        + ", ".join(f"`{c}`" for c in columns)
+    )
+
+    detected, ambiguities = detect_column_mapping(columns)
+    for field, candidates in ambiguities.items():
+        st.warning(
+            f"⚠️ Mais de uma coluna parece corresponder a **{field}**: "
+            + ", ".join(f"`{c}`" for c in candidates)
+            + ". Nenhuma foi escolhida automaticamente — selecione abaixo qual usar."
+        )
+
+    none_label = "(não mapear / deixar vazio)"
+    mapping = {}
+    map_cols = st.columns(len(IMPORT_FIELDS))
+    for col, field in zip(map_cols, IMPORT_FIELDS):
+        options = [none_label] + columns
+        default = detected.get(field)
+        label = field + (" *" if field in REQUIRED_IMPORT_FIELDS else "")
+        choice = col.selectbox(
+            label,
+            options,
+            index=options.index(default) if default in options else 0,
+            key=f"map_{field}_{uploaded.name}",
+        )
+        mapping[field] = None if choice == none_label else choice
+
+    fixed_category = ""
+    if mapping["categoria"] is None:
+        fixed_category = st.text_input(
+            "Categoria fixa para todas as linhas (opcional)",
+            help="Use quando o arquivo inteiro pertence a um único acervo, "
+            "em vez de mapear uma coluna de categoria.",
+            key=f"fixed_category_{uploaded.name}",
+        )
+
+    missing_required = [f for f in REQUIRED_IMPORT_FIELDS if mapping[f] is None]
+    if missing_required:
+        st.error(
+            "Mapeie os campos obrigatórios antes de continuar: "
+            + ", ".join(f"**{f}**" for f in missing_required)
+        )
+        return
+
+    mapped_rows = apply_column_mapping(raw_rows, mapping, fixed_category)
+    processed, summary = process_import_rows(conn, mapped_rows)
 
     st.subheader("Pré-visualização")
     col1, col2, col3, col4 = st.columns(4)
@@ -911,7 +1074,8 @@ def show_csv_import(conn):
     if error_rows:
         st.error(
             f"{len(error_rows)} linha(s) com erro bloqueante. "
-            "Corrija o arquivo e reenvie antes de confirmar a importação."
+            "Ajuste o mapeamento acima ou corrija o arquivo e reenvie "
+            "antes de confirmar a importação."
         )
         st.dataframe(error_rows, width="stretch")
 
@@ -919,7 +1083,7 @@ def show_csv_import(conn):
         count = commit_import(conn, processed)
         conn.commit()
         st.success(f"{count} livro(s) importado(s) com sucesso.")
-        for key in ("csv_import_processed", "csv_import_summary", "csv_import_filename"):
+        for key in ("csv_import_rows", "csv_import_filename"):
             st.session_state.pop(key, None)
         st.rerun()
 
