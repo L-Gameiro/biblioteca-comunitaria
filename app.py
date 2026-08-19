@@ -1219,9 +1219,15 @@ def _inject_card_border_css() -> None:
 
 def main():
     st.set_page_config(
-        page_title="Biblioteca Comunitária", page_icon="assets/logo_cce.png", layout="wide"
+        page_title="Biblioteca Comunitária",
+        page_icon="assets/logo_pequeno_cce.png",
+        layout="wide",
     )
-    st.logo("assets/logo_cce.png")
+    st.logo(
+        "assets/logo_cce.png",
+        size="large",
+        icon_image="assets/logo_pequeno_cce.png",
+    )
     _inject_card_border_css()
     init_db()
 
