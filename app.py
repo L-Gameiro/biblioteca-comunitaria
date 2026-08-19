@@ -23,6 +23,7 @@ CSRF, etc. — não usar como está em produção real; a versão de produção
 import csv
 import hashlib
 import io
+import itertools
 import os
 import re
 import unicodedata
@@ -541,20 +542,25 @@ def _detect_csv_delimiter(text: str) -> str:
     Levanta ValueError, com mensagem clara, se nenhum candidato produzir
     mais de uma coluna — nesse caso não seguimos adiante com uma coluna só.
     """
-    sample_lines = [line for line in text.splitlines()[:20] if line.strip()]
-    if not sample_lines:
+    if not text.strip():
         raise ValueError("O arquivo CSV está vazio.")
 
     best_delimiter = None
     best_score = (1, 0.0)  # (nº de colunas mais frequente, taxa de consistência)
 
     for delimiter in CSV_DELIMITER_CANDIDATES:
+        # Lê direto do texto via csv.reader (que decide sozinho onde um
+        # registro termina, inclusive campos entre aspas com quebra de
+        # linha embutida) em vez de pré-quebrar em linhas com str.splitlines()
+        # antes de parsear — pré-quebrar é frágil porque corta um campo
+        # citado multilinha ao meio e distorce a amostra.
         try:
-            field_counts = [
-                len(row) for row in csv.reader(sample_lines, delimiter=delimiter) if row
-            ]
+            sample_rows = list(
+                itertools.islice(csv.reader(io.StringIO(text), delimiter=delimiter), 20)
+            )
         except csv.Error:
             continue
+        field_counts = [len(row) for row in sample_rows if row]
         if not field_counts:
             continue
 
@@ -1110,17 +1116,21 @@ def show_csv_import(conn):
     uploaded = st.file_uploader("Selecione o arquivo CSV", type=["csv"])
 
     if uploaded is None:
-        for key in ("csv_import_rows", "csv_import_filename"):
+        for key in ("csv_import_rows", "csv_import_signature"):
             st.session_state.pop(key, None)
         return
 
-    if st.session_state.get("csv_import_filename") != uploaded.name:
+    # Assinatura por (nome, tamanho): reprocessa se o conteúdo mudar, mesmo
+    # que o nome do arquivo permaneça o mesmo — reenviar uma versão corrigida
+    # do arquivo com o mesmo nome não pode reaproveitar um resultado velho.
+    upload_signature = (uploaded.name, uploaded.size)
+    if st.session_state.get("csv_import_signature") != upload_signature:
         try:
             st.session_state.csv_import_rows = parse_csv_bytes(uploaded.getvalue())
         except (UnicodeDecodeError, csv.Error, ValueError) as exc:
             st.error(f"Não foi possível ler o arquivo CSV: {exc}")
             return
-        st.session_state.csv_import_filename = uploaded.name
+        st.session_state.csv_import_signature = upload_signature
 
     raw_rows = st.session_state.csv_import_rows
     columns = get_csv_columns(raw_rows)
@@ -1213,7 +1223,7 @@ def show_csv_import(conn):
         count = commit_import(conn, processed)
         conn.commit()
         st.success(f"{count} livro(s) importado(s) com sucesso.")
-        for key in ("csv_import_rows", "csv_import_filename"):
+        for key in ("csv_import_rows", "csv_import_signature"):
             st.session_state.pop(key, None)
         st.rerun()
 

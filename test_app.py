@@ -288,6 +288,140 @@ def test_replica_bug_real_arquivo_12_colunas_bom_crlf_sem_aspas():
 
 
 # ---------------------------------------------------------------------------
+# Integração ponta a ponta: bytes do arquivo -> tela real de importação
+# (show_csv_import via AppTest), não só parse_csv_bytes isolado.
+# ---------------------------------------------------------------------------
+
+ESPIRITUAL_CSV_COLUMNS = [
+    "titulo", "autor", "categoria", "codigo", "status",
+    "editora", "ano", "paginas", "idioma", "localizacao", "doador", "obs",
+]
+
+
+def _espiritual_csv_bytes() -> bytes:
+    """Bytes com o mesmo perfil do espiritual.csv real do CCE: 12 colunas,
+    vírgula, UTF-8 com BOM, CRLF, sem nenhum campo entre aspas."""
+    header = ",".join(ESPIRITUAL_CSV_COLUMNS)
+    row1 = ",".join(f"{c}-1" for c in ESPIRITUAL_CSV_COLUMNS)
+    row2 = ",".join(f"{c}-2" for c in ESPIRITUAL_CSV_COLUMNS)
+    text = f"{header}\r\n{row1}\r\n{row2}\r\n"
+    return text.encode("utf-8-sig")
+
+
+def test_integracao_bytes_ate_get_csv_columns_espiritual_csv():
+    """Integração da camada de parsing: bytes -> parse_csv_bytes ->
+    get_csv_columns, com o perfil exato do arquivo que disparou o bug."""
+    data = _espiritual_csv_bytes()
+    rows = parse_csv_bytes(data)
+    columns = get_csv_columns(rows)
+    assert len(columns) == 12
+    assert columns == ESPIRITUAL_CSV_COLUMNS
+    assert rows[0]["titulo"] == "titulo-1"
+    assert rows[1]["obs"] == "obs-2"
+
+
+def test_integracao_tela_importacao_mostra_12_colunas(tmp_path, monkeypatch):
+    """Integração ponta a ponta pela tela real: sobe o app com AppTest, faz
+    upload do arquivo (mesmo perfil do espiritual.csv) e confirma que a tela
+    de Mapeamento de colunas mostra as 12 colunas — não a lógica isolada."""
+    from streamlit.testing.v1 import AppTest
+
+    data = _espiritual_csv_bytes()
+
+    class FakeUpload:
+        name = "espiritual.csv"
+        size = len(data)
+
+        def getvalue(self):
+            return data
+
+    database_url = f"sqlite:///{tmp_path}/integ_import.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    at.text_input(key="login_email").input("admin@biblioteca.org")
+    at.text_input(key="login_password").input("admin123")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+
+    at.radio[0].set_value("Importar CSV").run()
+    assert not at.exception, at.exception
+
+    summary_texts = [w.value for w in at.markdown if "coluna(s) encontrada" in (w.value or "")]
+    assert summary_texts, "tela não mostrou o resumo de linhas/colunas encontradas"
+    assert "**12**" in summary_texts[0], summary_texts[0]
+
+    # cada um dos 5 selectboxes de mapeamento deve oferecer as 12 colunas do
+    # arquivo (+ a opção "não mapear"), confirmando que a tela recebeu as
+    # 12 colunas de fato, não uma coluna só com a linha inteira dentro
+    map_selectboxes = [sb for sb in at.selectbox if sb.label.rstrip(" *") in
+                        {"titulo", "autor", "categoria", "codigo", "status"}]
+    assert len(map_selectboxes) == 5
+    for sb in map_selectboxes:
+        assert len(sb.options) == 13  # 12 colunas + "(não mapear / deixar vazio)"
+
+    titulo_sb = next(sb for sb in map_selectboxes if sb.label.startswith("titulo"))
+    assert titulo_sb.value == "titulo"  # detectado automaticamente
+
+
+def test_reenviar_arquivo_com_mesmo_nome_e_conteudo_diferente_reprocessa(tmp_path, monkeypatch):
+    """Reproduz o cenário que explicaria 'a correção não teve efeito na
+    prática': se o cache de sessão fosse chaveado só pelo nome do arquivo,
+    reenviar uma versão diferente do arquivo com o MESMO nome manteria o
+    resultado velho (de uma parse anterior bem-sucedida) na tela. A
+    assinatura precisa incluir o tamanho também.
+
+    As duas versões precisam parsear com SUCESSO (números de coluna
+    diferentes) — se a 1ª falhasse, o cache nunca seria populado e o teste
+    passaria mesmo com a chave antiga (só nome), sem provar nada."""
+    from streamlit.testing.v1 import AppTest
+
+    # 1ª versão: 2 colunas
+    data_v1 = "a,b\r\nvalor1,valor2\r\n".encode("utf-8-sig")
+    # 2ª versão, MESMO NOME, conteúdo diferente: 3 colunas
+    data_v2 = "titulo,autor,categoria\r\nLivro A,Autor A,Cat\r\n".encode("utf-8-sig")
+
+    state = {"data": data_v1}
+
+    class FakeUpload:
+        name = "arquivo.csv"
+
+        @property
+        def size(self):
+            return len(state["data"])
+
+        def getvalue(self):
+            return state["data"]
+
+    database_url = f"sqlite:///{tmp_path}/integ_reupload.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    at.text_input(key="login_email").input("admin@biblioteca.org")
+    at.text_input(key="login_password").input("admin123")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    at.radio[0].set_value("Importar CSV").run()
+    assert not at.exception, at.exception
+
+    summary_texts_v1 = [w.value for w in at.markdown if "coluna(s) encontrada" in (w.value or "")]
+    assert summary_texts_v1, "tela não mostrou o resumo na 1ª versão do arquivo"
+    assert "**2**" in summary_texts_v1[0], summary_texts_v1[0]
+
+    # "reenvia" uma versão diferente do arquivo, com o MESMO nome
+    state["data"] = data_v2
+    at.run()
+    assert not at.exception, at.exception
+
+    summary_texts_v2 = [w.value for w in at.markdown if "coluna(s) encontrada" in (w.value or "")]
+    assert summary_texts_v2, "tela não reprocessou o arquivo reenviado com o mesmo nome"
+    assert "**3**" in summary_texts_v2[0], summary_texts_v2[0]
+
+
+# ---------------------------------------------------------------------------
 # process_import_rows — regras de importação em lote
 # ---------------------------------------------------------------------------
 
