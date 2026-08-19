@@ -21,6 +21,7 @@ from app import (
     BookCodeAllocator,
     CODE_STRATEGY_AUTHOR,
     CODE_STRATEGY_NUMERIC,
+    _detect_csv_delimiter,
     add_book,
     apply_column_mapping,
     count_loans_for_book,
@@ -180,6 +181,110 @@ def test_parse_csv_bytes_com_bom_utf8_sig():
     assert rows[0]["titulo"] == "Dom Casmurro"
     # BOM não deve vazar para dentro do nome da primeira coluna
     assert list(rows[0].keys())[0] == "titulo"
+
+
+# ---------------------------------------------------------------------------
+# _detect_csv_delimiter — detecção robusta (bug real: espiritual.csv era lido
+# como uma única coluna quando as primeiras linhas não tinham campos citados)
+# ---------------------------------------------------------------------------
+
+def test_deteccao_virgula_sem_nenhum_campo_citado_nas_primeiras_linhas():
+    """(a) Reproduz o espiritual.csv: separado por vírgula, mas nenhuma das
+    primeiras linhas tem campos entre aspas — a heurística antiga (que
+    dependia de encontrar aspas) lia isso como 1 coluna só."""
+    text = (
+        "titulo,autor,categoria,codigo,status,obs1,obs2,obs3,obs4,obs5,obs6,obs7\r\n"
+        "Livro A,Autor A,Espiritual,1,Disponível,x,x,x,x,x,x,x\r\n"
+        "Livro B,Autor B,Espiritual,2,Disponível,x,x,x,x,x,x,x\r\n"
+    )
+    assert _detect_csv_delimiter(text) == ","
+
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(get_csv_columns(rows)) == 12
+    assert rows[0]["titulo"] == "Livro A"
+    assert rows[0]["codigo"] == "1"
+
+
+def test_deteccao_virgula_com_campos_citados_na_primeira_linha_de_dados():
+    """(b) Reproduz o literaria.csv: separado por vírgula, com campos entre
+    aspas já na 1ª linha de dados — já funcionava antes, continua funcionando."""
+    text = (
+        "titulo,autor,categoria\r\n"
+        '"Dom Casmurro","Machado de Assis","Literária"\r\n'
+        "Vidas Secas,Graciliano Ramos,Literária\r\n"
+    )
+    assert _detect_csv_delimiter(text) == ","
+
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(get_csv_columns(rows)) == 3
+    assert rows[0]["titulo"] == "Dom Casmurro"
+    assert rows[1]["titulo"] == "Vidas Secas"
+
+
+def test_deteccao_ponto_e_virgula_sem_nenhum_campo_citado():
+    """(c) Mesma situação de (a), mas com ';' como separador."""
+    text = (
+        "titulo;autor;categoria;codigo\r\n"
+        "Livro A;Autor A;Literária;ABC-001\r\n"
+        "Livro B;Autor B;Literária;ABC-002\r\n"
+    )
+    assert _detect_csv_delimiter(text) == ";"
+
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(get_csv_columns(rows)) == 4
+    assert rows[0]["codigo"] == "ABC-001"
+
+
+def test_deteccao_com_virgulas_dentro_de_campos_citados():
+    """(d) Conteúdo de texto com vírgulas dentro de campos entre aspas não
+    pode inflar a contagem de colunas nem confundir a escolha do delimitador."""
+    text = (
+        "titulo,autor,categoria\r\n"
+        '"Memórias, Póstumas de Brás Cubas",Machado de Assis,Literária\r\n'
+        '"Outro Livro, com vírgula no meio",Outro Autor,Literária\r\n'
+    )
+    assert _detect_csv_delimiter(text) == ","
+
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(get_csv_columns(rows)) == 3
+    assert rows[0]["titulo"] == "Memórias, Póstumas de Brás Cubas"
+    assert rows[1]["titulo"] == "Outro Livro, com vírgula no meio"
+
+
+def test_deteccao_falha_com_erro_claro_quando_nenhum_candidato_funciona():
+    text = "apenasumacoluna\nsemdelimitadornenhum\noutralinha\n"
+
+    with pytest.raises(ValueError):
+        _detect_csv_delimiter(text)
+
+    with pytest.raises(ValueError):
+        parse_csv_bytes(text.encode("utf-8"))
+
+
+def test_deteccao_considera_consistencia_ao_longo_de_ate_20_linhas():
+    header = "titulo,autor,categoria,codigo"
+    data_lines = [f"Livro {i},Autor {i},Literária,COD-{i:03d}" for i in range(25)]
+    text = "\r\n".join([header] + data_lines) + "\r\n"
+
+    assert _detect_csv_delimiter(text) == ","
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(rows) == 25
+    assert len(get_csv_columns(rows)) == 4
+
+
+def test_replica_bug_real_arquivo_12_colunas_bom_crlf_sem_aspas():
+    """Reprodução fiel do bug relatado: 12 colunas, vírgula, UTF-8 com BOM,
+    CRLF, sem aspas nas primeiras linhas de dados."""
+    columns = [f"col{i}" for i in range(12)]
+    header = ",".join(columns)
+    row1 = ",".join(f"v{i}a" for i in range(12))
+    row2 = ",".join(f"v{i}b" for i in range(12))
+    text = f"{header}\r\n{row1}\r\n{row2}\r\n"
+
+    rows = parse_csv_bytes(text.encode("utf-8-sig"))
+    assert len(get_csv_columns(rows)) == 12
+    assert rows[0]["col0"] == "v0a"
+    assert rows[1]["col11"] == "v11b"
 
 
 # ---------------------------------------------------------------------------

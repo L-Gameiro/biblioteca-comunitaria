@@ -26,6 +26,7 @@ import io
 import os
 import re
 import unicodedata
+from collections import Counter
 from datetime import datetime
 from functools import lru_cache
 
@@ -520,21 +521,73 @@ def apply_column_mapping(
     return mapped_rows
 
 
+CSV_DELIMITER_CANDIDATES = (",", ";")
+
+
+def _detect_csv_delimiter(text: str) -> str:
+    """Detecta o delimitador (',' ou ';') testando cada candidato contra as
+    primeiras ~20 linhas do arquivo.
+
+    Para cada candidato, parseia as linhas com csv.reader (que já respeita
+    campos entre aspas, inclusive delimitadores dentro deles) e mede: (a) o
+    número de colunas mais frequente entre as linhas, e (b) a consistência
+    — em que fração das linhas esse número de colunas se repete. Um
+    candidato cujo resultado mais comum é 1 coluna só é descartado, mesmo
+    que nenhuma linha de amostra tenha campos citados (é exatamente o caso
+    que quebrava antes: arquivo separado por vírgula sem aspas nas
+    primeiras linhas era lido como uma coluna só, porque a heurística antiga
+    dependia de encontrar aspas para funcionar).
+
+    Levanta ValueError, com mensagem clara, se nenhum candidato produzir
+    mais de uma coluna — nesse caso não seguimos adiante com uma coluna só.
+    """
+    sample_lines = [line for line in text.splitlines()[:20] if line.strip()]
+    if not sample_lines:
+        raise ValueError("O arquivo CSV está vazio.")
+
+    best_delimiter = None
+    best_score = (1, 0.0)  # (nº de colunas mais frequente, taxa de consistência)
+
+    for delimiter in CSV_DELIMITER_CANDIDATES:
+        try:
+            field_counts = [
+                len(row) for row in csv.reader(sample_lines, delimiter=delimiter) if row
+            ]
+        except csv.Error:
+            continue
+        if not field_counts:
+            continue
+
+        most_common_count, occurrences = Counter(field_counts).most_common(1)[0]
+        if most_common_count <= 1:
+            continue  # delimitador não aparece nas linhas -> viraria 1 coluna só
+
+        consistency = occurrences / len(field_counts)
+        score = (most_common_count, consistency)
+        if score > best_score:
+            best_score = score
+            best_delimiter = delimiter
+
+    if best_delimiter is None:
+        raise ValueError(
+            "Não foi possível detectar o delimitador do CSV: nem vírgula nem "
+            "ponto-e-vírgula produziram mais de uma coluna nas primeiras linhas "
+            "do arquivo. Verifique se o arquivo está no formato esperado."
+        )
+
+    return best_delimiter
+
+
 def parse_csv_bytes(data: bytes) -> list[dict]:
-    """Decodifica bytes de um CSV (UTF-8 com ou sem BOM) e detecta o
-    delimitador (',' ou ';') automaticamente. Retorna uma lista de dicts
-    com as chaves das colunas normalizadas (minúsculas, sem espaços)."""
+    """Decodifica bytes de um CSV (UTF-8 com ou sem BOM, CRLF ou LF) e
+    detecta o delimitador (',' ou ';') automaticamente. Retorna uma lista de
+    dicts com as chaves das colunas normalizadas (minúsculas, sem espaços)."""
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = data.decode("utf-8")
 
-    sample = text[:2048]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;")
-        delimiter = dialect.delimiter
-    except csv.Error:
-        delimiter = ";" if sample.count(";") > sample.count(",") else ","
+    delimiter = _detect_csv_delimiter(text)
 
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
     return [
@@ -1064,7 +1117,7 @@ def show_csv_import(conn):
     if st.session_state.get("csv_import_filename") != uploaded.name:
         try:
             st.session_state.csv_import_rows = parse_csv_bytes(uploaded.getvalue())
-        except (UnicodeDecodeError, csv.Error) as exc:
+        except (UnicodeDecodeError, csv.Error, ValueError) as exc:
             st.error(f"Não foi possível ler o arquivo CSV: {exc}")
             return
         st.session_state.csv_import_filename = uploaded.name
