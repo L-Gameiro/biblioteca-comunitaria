@@ -124,9 +124,10 @@ Cobrem: a geração de código de livro (`generate_book_code`, mesmos casos de
 borda do `bookCode.test.ts`), a estratégia de código por acervo
 (`get_code_strategy`, `BookCodeAllocator`), a lógica de importação em lote via CSV
 (`parse_csv_bytes`, `process_import_rows`), o mapeamento flexível de colunas
-(`detect_column_mapping`, `apply_column_mapping`, `normalize_status`),
-inicialização do schema e do admin padrão (`init_db`), o fluxo de
-empréstimo/devolução e a
+(`detect_column_mapping`, `apply_column_mapping`, `normalize_status`), a busca
+com filtros e paginação no banco (`count_books`, `list_books`,
+`list_book_categories`), inicialização do schema e do admin padrão
+(`init_db`), o fluxo de empréstimo/devolução e a
 remoção de livros (`delete_book`).
 
 ## Código do livro por acervo
@@ -260,6 +261,37 @@ titulo,autor,categoria,codigo,status
 Dom Casmurro,Machado de Assis,Literatura Brasileira,,
 O Cortiço,Aluísio Azevedo,Literatura Brasileira,COR-A-001,Disponível
 ```
+
+## Busca, filtros e paginação do acervo
+
+As telas **Catálogo** e **Gestão de Livros** compartilham os mesmos controles:
+
+- **Busca** por título, autor, código ou categoria.
+- **Filtro por categoria**, com as opções carregadas dinamicamente do banco
+  (`SELECT DISTINCT categoria`) mais a opção `Todas`.
+- **Filtro por status**: `Disponível` / `Emprestado` / `Em Manutenção` / `Todos`.
+- Busca e filtros **combinam** (AND entre eles) — o filtro não substitui a busca.
+- **Paginação de 25 itens**, com navegação e indicação de
+  `X–Y de N resultado(s) · página P de T`. Trocar a busca ou os filtros
+  volta para a primeira página.
+
+Tudo é resolvido no banco (`WHERE` + `LIKE`/`ILIKE` + `LIMIT`/`OFFSET`): só a
+página exibida trafega, o que importa porque o acervo real tem ~2.552 livros e
+a Gestão de Livros renderiza um `st.expander` por livro.
+
+**Busca sem acento e sem diferenciar maiúsculas:** buscar `reflexoes` encontra
+`Reflexões`, e `MEMORIAS` encontra `Memórias Póstumas`. Isso é feito com uma
+cadeia de `REPLACE` aninhados sobre a coluna, e não com o `unaccent()` do
+Postgres, por dois motivos: `unaccent()` exige `CREATE EXTENSION unaccent`
+(não habilitada por padrão no Supabase) e não existe no SQLite usado pelos
+testes. Os acentos são removidos em maiúsculas **e** minúsculas antes da
+comparação, porque o `LOWER()` do SQLite é ASCII-only e não converteria `Ó`
+em `ó` — sem isso a busca funcionaria em produção e falharia nos testes.
+
+> Nota de escala: a cadeia de `REPLACE` impede o uso de índice na busca
+> textual (varredura sequencial). Para ~2.5k livros isso é irrelevante, mas se
+> o acervo crescer muito, o próximo passo é uma coluna gerada e indexada com o
+> texto já normalizado, ou `pg_trgm` + `unaccent` no Postgres.
 
 ## Painéis administrativos de empréstimos
 

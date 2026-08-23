@@ -19,11 +19,14 @@ from sqlalchemy import text
 import app
 from app import (
     BookCodeAllocator,
+    CATEGORY_FILTER_ALL,
     CODE_STRATEGY_AUTHOR,
     CODE_STRATEGY_NUMERIC,
+    STATUS_FILTER_ALL,
     _detect_csv_delimiter,
     add_book,
     apply_column_mapping,
+    count_books,
     count_loans_for_book,
     create_schema,
     create_user,
@@ -37,6 +40,8 @@ from app import (
     get_user_by_email,
     init_db,
     is_valid_email,
+    list_book_categories,
+    list_books,
     max_numeric_code_for_category,
     normalize_status,
     parse_csv_bytes,
@@ -1103,3 +1108,238 @@ def test_unicidade_continua_bloqueando_duplicatas_nas_duas_estrategias(conn):
     assert processed[1]["erros"] == []
     assert any("Código duplicado" in e for e in processed[2]["erros"])  # dentro do lote
     assert summary["com_erro"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Busca, filtros e paginação no banco (acervo real tem ~2.552 livros)
+# ---------------------------------------------------------------------------
+
+def _add_books(conn, entries):
+    """entries: lista de (titulo, autor, categoria[, status])."""
+    for entry in entries:
+        title, author, category = entry[0], entry[1], entry[2]
+        add_book(conn, title, author, category)
+        if len(entry) > 3:
+            conn.execute(
+                text("UPDATE books SET status = :s WHERE title = :t"),
+                {"s": entry[3], "t": title},
+            )
+    conn.commit()
+
+
+@pytest.fixture
+def catalogo(conn):
+    _add_books(
+        conn,
+        [
+            ("Dom Casmurro", "Machado de Assis", "Literária", "Disponível"),
+            ("Memórias Póstumas", "Machado de Assis", "Literária", "Emprestado"),
+            ("Reflexões sobre a Vida", "José Álvares", "Espiritual", "Disponível"),
+            ("O Livro dos Espíritos", "Allan Kardec", "Espiritual", "Em Manutenção"),
+            ("Vidas Secas", "Graciliano Ramos", "Literária", "Disponível"),
+        ],
+    )
+    return conn
+
+
+def _titles(rows):
+    return sorted(r["title"] for r in rows)
+
+
+# --- busca por cada campo --------------------------------------------------
+
+def test_busca_por_titulo(catalogo):
+    assert _titles(list_books(catalogo, query="Casmurro")) == ["Dom Casmurro"]
+
+
+def test_busca_por_autor(catalogo):
+    assert _titles(list_books(catalogo, query="Kardec")) == ["O Livro dos Espíritos"]
+
+
+def test_busca_por_codigo(catalogo):
+    code = catalogo.execute(
+        text("SELECT code FROM books WHERE title = 'Vidas Secas'")
+    ).scalars().first()
+    assert _titles(list_books(catalogo, query=code)) == ["Vidas Secas"]
+
+
+def test_busca_por_categoria(catalogo):
+    assert _titles(list_books(catalogo, query="Espiritual")) == [
+        "O Livro dos Espíritos",
+        "Reflexões sobre a Vida",
+    ]
+
+
+def test_busca_sem_resultado_retorna_vazio(catalogo):
+    assert list_books(catalogo, query="inexistente") == []
+    assert count_books(catalogo, query="inexistente") == 0
+
+
+# --- busca case-insensitive e sem acento -----------------------------------
+
+@pytest.mark.parametrize(
+    "term,expected",
+    [
+        ("reflexoes", "Reflexões sobre a Vida"),   # sem acento -> com acento
+        ("REFLEXÕES", "Reflexões sobre a Vida"),   # maiúsculas + acento
+        ("Reflexoes", "Reflexões sobre a Vida"),   # caixa mista, sem acento
+        ("memorias", "Memórias Póstumas"),
+        ("MEMORIAS", "Memórias Póstumas"),
+        ("espiritos", "O Livro dos Espíritos"),
+        ("casmurro", "Dom Casmurro"),
+        ("CASMURRO", "Dom Casmurro"),
+    ],
+)
+def test_busca_case_insensitive_e_sem_acento(catalogo, term, expected):
+    assert expected in _titles(list_books(catalogo, query=term))
+
+
+def test_busca_sem_acento_tambem_no_autor(catalogo):
+    # "José Álvares" encontrado digitando sem nenhum acento
+    assert _titles(list_books(catalogo, query="jose alvares")) == [
+        "Reflexões sobre a Vida"
+    ]
+
+
+# --- filtros ---------------------------------------------------------------
+
+def test_list_book_categories_traz_categorias_distintas_ordenadas(catalogo):
+    assert list_book_categories(catalogo) == ["Espiritual", "Literária"]
+
+
+def test_filtro_por_categoria(catalogo):
+    assert count_books(catalogo, category="Literária") == 3
+    assert _titles(list_books(catalogo, category="Espiritual")) == [
+        "O Livro dos Espíritos",
+        "Reflexões sobre a Vida",
+    ]
+
+
+def test_filtro_por_status(catalogo):
+    assert count_books(catalogo, status="Disponível") == 3
+    assert _titles(list_books(catalogo, status="Emprestado")) == ["Memórias Póstumas"]
+    assert _titles(list_books(catalogo, status="Em Manutenção")) == [
+        "O Livro dos Espíritos"
+    ]
+
+
+def test_filtros_com_valor_todos_nao_restringem(catalogo):
+    total = count_books(catalogo)
+    assert total == 5
+    assert count_books(catalogo, category=CATEGORY_FILTER_ALL) == total
+    assert count_books(catalogo, status=STATUS_FILTER_ALL) == total
+    assert count_books(
+        catalogo, category=CATEGORY_FILTER_ALL, status=STATUS_FILTER_ALL
+    ) == total
+
+
+# --- combinação de busca + filtros -----------------------------------------
+
+def test_busca_combina_com_filtro_de_categoria(catalogo):
+    # "Machado" existe só na Literária; combinada com Espiritual não retorna nada
+    assert _titles(list_books(catalogo, query="Machado", category="Literária")) == [
+        "Dom Casmurro",
+        "Memórias Póstumas",
+    ]
+    assert list_books(catalogo, query="Machado", category="Espiritual") == []
+
+
+def test_busca_combina_com_filtro_de_status(catalogo):
+    assert _titles(list_books(catalogo, query="Machado", status="Disponível")) == [
+        "Dom Casmurro"
+    ]
+    assert _titles(list_books(catalogo, query="Machado", status="Emprestado")) == [
+        "Memórias Póstumas"
+    ]
+
+
+def test_busca_combina_com_os_dois_filtros(catalogo):
+    assert count_books(
+        catalogo, query="Machado", category="Literária", status="Disponível"
+    ) == 1
+    assert count_books(
+        catalogo, query="Machado", category="Literária", status="Em Manutenção"
+    ) == 0
+
+
+# --- paginação -------------------------------------------------------------
+
+@pytest.fixture
+def acervo_grande(conn):
+    """60 livros para exercitar múltiplas páginas de 25.
+
+    Insere com código explícito em vez de usar add_book porque autores como
+    "Autor 001" gerariam todos o mesmo código (os dígitos não são letras)."""
+    for i in range(60):
+        conn.execute(
+            text(
+                "INSERT INTO books (code, title, author, category, status, created_at) "
+                "VALUES (:code, :title, :author, 'Literária', 'Disponível', '2026-01-01')"
+            ),
+            {
+                "code": f"PAG-{i:03d}",
+                "title": f"Livro {i:03d}",
+                "author": f"Autor {i:03d}",
+            },
+        )
+    conn.commit()
+    return conn
+
+
+def test_paginacao_contagem_total_independe_da_pagina(acervo_grande):
+    assert count_books(acervo_grande) == 60
+
+
+def test_paginacao_primeira_pagina(acervo_grande):
+    page = list_books(acervo_grande, limit=25, offset=0)
+    assert len(page) == 25
+    assert page[0]["title"] == "Livro 000"
+    assert page[-1]["title"] == "Livro 024"
+
+
+def test_paginacao_pagina_do_meio(acervo_grande):
+    page = list_books(acervo_grande, limit=25, offset=25)
+    assert len(page) == 25
+    assert page[0]["title"] == "Livro 025"
+    assert page[-1]["title"] == "Livro 049"
+
+
+def test_paginacao_ultima_pagina_parcial(acervo_grande):
+    page = list_books(acervo_grande, limit=25, offset=50)
+    assert len(page) == 10  # 60 - 50
+    assert page[0]["title"] == "Livro 050"
+    assert page[-1]["title"] == "Livro 059"
+
+
+def test_paginacao_offset_alem_do_total_retorna_vazio(acervo_grande):
+    assert list_books(acervo_grande, limit=25, offset=100) == []
+
+
+def test_paginacao_nao_repete_nem_perde_registros(acervo_grande):
+    seen = []
+    for offset in range(0, 60, 25):
+        seen += [r["title"] for r in list_books(acervo_grande, limit=25, offset=offset)]
+    assert len(seen) == 60
+    assert len(set(seen)) == 60  # sem duplicatas entre páginas
+
+
+def test_paginacao_respeita_busca_e_filtros(acervo_grande):
+    # busca que casa com 10 livros (Livro 010..019)
+    total = count_books(acervo_grande, query="Livro 01")
+    assert total == 10
+    page = list_books(acervo_grande, query="Livro 01", limit=25, offset=0)
+    assert len(page) == 10
+    assert count_books(acervo_grande, query="Livro 01", status="Emprestado") == 0
+
+
+def test_ordenacao_newest_first_inverte_a_ordem(acervo_grande):
+    por_titulo = list_books(acervo_grande, limit=3, offset=0)
+    mais_novos = list_books(acervo_grande, limit=3, offset=0, newest_first=True)
+    assert [r["title"] for r in por_titulo] == ["Livro 000", "Livro 001", "Livro 002"]
+    assert [r["title"] for r in mais_novos] == ["Livro 059", "Livro 058", "Livro 057"]
+
+
+def test_apenas_a_pagina_solicitada_e_trazida_do_banco(acervo_grande):
+    """O ponto do requisito: filtrar/paginar no SQL, não em Python."""
+    assert len(list_books(acervo_grande, limit=25, offset=0)) == 25
+    assert len(list_books(acervo_grande, limit=5, offset=0)) == 5

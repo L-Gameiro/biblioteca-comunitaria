@@ -41,6 +41,9 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    func,
+    or_,
+    select,
     text,
 )
 from sqlalchemy.engine import Connection, Engine
@@ -413,6 +416,120 @@ def delete_book(conn, book_id) -> None:
         )
     conn.execute(text("DELETE FROM loans WHERE book_id = :book_id"), {"book_id": book_id})
     conn.execute(text("DELETE FROM books WHERE id = :id"), {"id": book_id})
+
+
+# ---------------------------------------------------------------------------
+# Busca, filtros e paginação de livros (tudo resolvido no banco)
+# ---------------------------------------------------------------------------
+
+BOOKS_PAGE_SIZE = 25
+CATEGORY_FILTER_ALL = "Todas"
+STATUS_FILTER_ALL = "Todos"
+
+# Acentos que aparecem no acervo, em MAIÚSCULAS e minúsculas. Precisamos das
+# duas caixas porque o LOWER() do SQLite é ASCII-only: ele não converte 'Ó'
+# em 'ó', então remover só as minúsculas deixaria "MEMÓRIAS" sem normalizar
+# (no Postgres o LOWER() é Unicode-aware e funcionaria — divergência que
+# faria a busca passar nos testes e falhar em produção, ou vice-versa).
+_SEARCH_ACCENT_MAP = {
+    "á": "a", "à": "a", "â": "a", "ã": "a", "ä": "a",
+    "é": "e", "è": "e", "ê": "e", "ë": "e",
+    "í": "i", "ì": "i", "î": "i", "ï": "i",
+    "ó": "o", "ò": "o", "ô": "o", "õ": "o", "ö": "o",
+    "ú": "u", "ù": "u", "û": "u", "ü": "u",
+    "ç": "c", "ñ": "n",
+}
+_SEARCH_ACCENT_MAP.update(
+    {accented.upper(): plain.upper() for accented, plain in list(_SEARCH_ACCENT_MAP.items())}
+)
+
+
+def _sql_unaccent(column):
+    """Expressão SQL que remove os acentos de uma coluna, preservando a caixa.
+
+    Usa REPLACE aninhado em vez do unaccent() do Postgres porque unaccent()
+    exige `CREATE EXTENSION unaccent` (não habilitada por padrão no Supabase)
+    e não existe no SQLite usado pelos testes — assim a mesma query roda
+    igual nos dois bancos, sem extensão.
+
+    O resultado é ASCII puro, então a comparação com ILIKE resolve a caixa
+    de forma idêntica em Postgres (ILIKE nativo) e SQLite (LOWER LIKE LOWER).
+    """
+    expr = column
+    for accented, plain in _SEARCH_ACCENT_MAP.items():
+        expr = func.replace(expr, accented, plain)
+    return expr
+
+
+def normalize_search_term(term: str | None) -> str:
+    """Mesma normalização do lado Python, para o termo digitado."""
+    return _strip_diacritics(term or "").lower().strip()
+
+
+def _books_where_clauses(query: str = "", category: str | None = None, status: str | None = None):
+    """Cláusulas WHERE para busca textual + filtros. A busca combina com os
+    filtros (AND entre eles), não os substitui."""
+    clauses = []
+
+    term = normalize_search_term(query)
+    if term:
+        pattern = f"%{term}%"
+        searchable = (
+            books_table.c.title,
+            books_table.c.author,
+            books_table.c.code,
+            func.coalesce(books_table.c.category, ""),
+        )
+        clauses.append(
+            or_(*[_sql_unaccent(col).ilike(pattern) for col in searchable])
+        )
+
+    if category and category != CATEGORY_FILTER_ALL:
+        clauses.append(books_table.c.category == category)
+
+    if status and status != STATUS_FILTER_ALL:
+        clauses.append(books_table.c.status == status)
+
+    return clauses
+
+
+def count_books(conn, query: str = "", category: str | None = None, status: str | None = None) -> int:
+    """Total de livros que satisfazem busca + filtros (para a paginação)."""
+    stmt = select(func.count()).select_from(books_table)
+    for clause in _books_where_clauses(query, category, status):
+        stmt = stmt.where(clause)
+    return conn.execute(stmt).scalar_one()
+
+
+def list_books(
+    conn,
+    query: str = "",
+    category: str | None = None,
+    status: str | None = None,
+    limit: int = BOOKS_PAGE_SIZE,
+    offset: int = 0,
+    newest_first: bool = False,
+):
+    """Uma página de livros já filtrada e ordenada pelo banco — só as linhas
+    exibidas trafegam (o acervo real tem ~2.5k livros)."""
+    stmt = select(books_table)
+    for clause in _books_where_clauses(query, category, status):
+        stmt = stmt.where(clause)
+    order = books_table.c.id.desc() if newest_first else books_table.c.title
+    stmt = stmt.order_by(order).limit(limit).offset(offset)
+    return conn.execute(stmt).mappings().all()
+
+
+def list_book_categories(conn) -> list[str]:
+    """Categorias distintas presentes no acervo, para alimentar o filtro."""
+    stmt = (
+        select(books_table.c.category)
+        .distinct()
+        .where(books_table.c.category.isnot(None))
+        .where(books_table.c.category != "")
+        .order_by(books_table.c.category)
+    )
+    return list(conn.execute(stmt).scalars().all())
 
 
 # ---------------------------------------------------------------------------
@@ -795,23 +912,80 @@ def show_auth_screen(conn):
                     st.success("Cadastro realizado! Faça login na aba ao lado.")
 
 
+BOOK_STATUSES = ["Disponível", "Emprestado", "Em Manutenção"]
+STATUS_EMOJI = {"Disponível": "🟢", "Emprestado": "🔴", "Em Manutenção": "🟡"}
+
+
+def _book_search_controls(conn, key_prefix: str):
+    """Campo de busca + filtros de categoria e status, compartilhados pelo
+    Catálogo e pela Gestão de Livros. Devolve (busca, categoria, status)."""
+    query = st.text_input(
+        "Buscar por título, autor, código ou categoria", key=f"{key_prefix}_query"
+    )
+    col_cat, col_status = st.columns(2)
+    category = col_cat.selectbox(
+        "Categoria",
+        [CATEGORY_FILTER_ALL] + list_book_categories(conn),
+        key=f"{key_prefix}_category",
+    )
+    status = col_status.selectbox(
+        "Status", [STATUS_FILTER_ALL] + BOOK_STATUSES, key=f"{key_prefix}_status"
+    )
+
+    # Mudou a busca ou os filtros -> volta para a 1ª página, senão o usuário
+    # cairia numa página do meio de um resultado que acabou de mudar.
+    signature = (query, category, status)
+    signature_key = f"{key_prefix}_filter_signature"
+    if st.session_state.get(signature_key) != signature:
+        st.session_state[signature_key] = signature
+        st.session_state[f"{key_prefix}_page"] = 1
+
+    return query, category, status
+
+
+def _paginate(total: int, key_prefix: str) -> int:
+    """Navegação de páginas + "X–Y de N resultados". Devolve o OFFSET da
+    página atual, mantendo a página escolhida em session_state e
+    reposicionando quando os filtros encolhem o resultado."""
+    page_key = f"{key_prefix}_page"
+    total_pages = max(1, (total + BOOKS_PAGE_SIZE - 1) // BOOKS_PAGE_SIZE)
+    page = min(st.session_state.get(page_key, 1), total_pages)
+    st.session_state[page_key] = page
+
+    first = (page - 1) * BOOKS_PAGE_SIZE + 1
+    last = min(page * BOOKS_PAGE_SIZE, total)
+
+    col_prev, col_info, col_next = st.columns([1, 3, 1])
+    if col_prev.button(
+        "◀ Anterior", key=f"{key_prefix}_prev", disabled=page <= 1, width="stretch"
+    ):
+        st.session_state[page_key] = page - 1
+        st.rerun()
+    col_info.markdown(
+        f"<div style='text-align:center'>{first}–{last} de <b>{total}</b> resultado(s)"
+        f" · página {page} de {total_pages}</div>",
+        unsafe_allow_html=True,
+    )
+    if col_next.button(
+        "Próxima ▶", key=f"{key_prefix}_next", disabled=page >= total_pages, width="stretch"
+    ):
+        st.session_state[page_key] = page + 1
+        st.rerun()
+
+    return (page - 1) * BOOKS_PAGE_SIZE
+
+
 def show_catalog(conn, user):
     st.header("Catálogo de Livros")
-    query = st.text_input("Buscar por título, autor, código ou categoria")
-    rows = conn.execute(text("SELECT * FROM books ORDER BY title")).mappings().all()
+    query, category, status = _book_search_controls(conn, "catalog")
 
-    if query:
-        q = query.lower()
-        rows = [
-            r
-            for r in rows
-            if q in r["title"].lower()
-            or q in r["author"].lower()
-            or q in r["code"].lower()
-            or q in (r["category"] or "").lower()
-        ]
+    total = count_books(conn, query, category, status)
+    if not total:
+        st.info("Nenhum livro encontrado.")
+        return
 
-    status_emoji = {"Disponível": "🟢", "Emprestado": "🔴", "Em Manutenção": "🟡"}
+    offset = _paginate(total, "catalog")
+    rows = list_books(conn, query, category, status, offset=offset)
 
     for r in rows:
         with st.container(border=True):
@@ -819,7 +993,7 @@ def show_catalog(conn, user):
             with info_col:
                 st.markdown(f"**{r['title']}**")
                 st.caption(f"{r['author']} · {r['code']}")
-                st.write(f"{status_emoji.get(r['status'], '')} {r['status']}")
+                st.write(f"{STATUS_EMOJI.get(r['status'], '')} {r['status']}")
             with action_col:
                 if user["role"] == "leitor" and r["status"] == "Disponível":
                     if st.button(
@@ -829,9 +1003,6 @@ def show_catalog(conn, user):
                         conn.commit()
                         st.success(f'Empréstimo de "{r["title"]}" registrado!')
                         st.rerun()
-
-    if not rows:
-        st.info("Nenhum livro encontrado.")
 
 
 def show_book_management(conn):
@@ -859,8 +1030,17 @@ def show_book_management(conn):
                     )
 
     st.subheader("Livros cadastrados")
-    statuses = ["Disponível", "Emprestado", "Em Manutenção"]
-    rows = conn.execute(text("SELECT * FROM books ORDER BY id DESC")).mappings().all()
+    statuses = BOOK_STATUSES
+    query, category, status = _book_search_controls(conn, "manage")
+
+    total = count_books(conn, query, category, status)
+    if not total:
+        st.info("Nenhum livro encontrado.")
+        return
+
+    offset = _paginate(total, "manage")
+    rows = list_books(conn, query, category, status, offset=offset, newest_first=True)
+
     for r in rows:
         with st.expander(f"{r['code']} — {r['title']}"):
             with st.form(f"edit_form_{r['id']}"):
