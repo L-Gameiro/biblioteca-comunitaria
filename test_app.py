@@ -13,6 +13,8 @@ Os testes usam SQLite local descartável através da mesma camada SQLAlchemy
 usada em produção (Postgres/Supabase) — não dependem de acesso de rede.
 """
 
+import csv
+import io
 from datetime import date, timedelta
 
 import pytest
@@ -37,8 +39,11 @@ from app import (
     default_due_date,
     delete_book,
     detect_column_mapping,
+    export_books_csv,
+    export_loans_csv,
     generate_book_code,
     get_code_strategy,
+    get_dashboard_metrics,
     get_connection,
     get_csv_columns,
     get_engine,
@@ -1902,3 +1907,261 @@ def test_conflito_real_entre_duas_conexoes_simultaneas(tmp_path):
     finally:
         admin_a.close()
         admin_b.close()
+
+
+# ---------------------------------------------------------------------------
+# Painel de indicadores e exportação CSV
+# ---------------------------------------------------------------------------
+
+def _decode_csv(data: bytes):
+    """Decodifica o CSV exportado e devolve (texto, linhas parseadas)."""
+    assert data.startswith(b"\xef\xbb\xbf"), "CSV precisa começar com BOM UTF-8"
+    text_content = data.decode("utf-8-sig")
+    return text_content, list(csv.reader(io.StringIO(text_content)))
+
+
+@pytest.fixture
+def acervo_com_indicadores(conn):
+    """Cenário com números conhecidos para conferir cada indicador."""
+    create_user(conn, "Leitora A", "a@teste.org", "111", "senha123", "leitor")
+    create_user(conn, "Leitor B", "b@teste.org", "222", "senha123", "leitor")
+    create_user(conn, "Admin Extra", "admin2@teste.org", "", "senha123", "admin")
+    conn.commit()
+
+    codes = {}
+    for titulo, autor, categoria in [
+        ("Livro Disponível", "Ana Silva", "Literária"),
+        ("Livro Emprestado No Prazo", "Bruno Costa", "Literária"),
+        ("Livro Atrasado", "Carla Dias", "Literária"),
+        ("Livro Em Manutenção", "Diego Souza", "Espiritual"),
+        ("Livro Sem Registro", "Elena Rocha", "Espiritual"),
+    ]:
+        codes[titulo] = add_book(conn, titulo, autor, categoria)
+    conn.commit()
+
+    leitora = get_user_by_email(conn, "a@teste.org")
+
+    # empréstimo no prazo
+    request_loan(
+        conn,
+        _book_by_code(conn, codes["Livro Emprestado No Prazo"])["id"],
+        leitora["id"],
+        due_date=date(2026, 12, 31),
+    )
+    # empréstimo atrasado
+    request_loan(
+        conn,
+        _book_by_code(conn, codes["Livro Atrasado"])["id"],
+        leitora["id"],
+        due_date=date(2020, 1, 10),
+    )
+    conn.commit()
+
+    _set_book_status(conn, codes["Livro Em Manutenção"], "Em Manutenção")
+    # emprestado na planilha, sem loan -> pendente de reconciliação
+    _set_book_status(conn, codes["Livro Sem Registro"], "Emprestado")
+
+    return conn, codes, leitora
+
+
+def test_indicadores_com_dados_conhecidos(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    m = get_dashboard_metrics(conn, reference_date=date(2026, 6, 1))
+
+    assert m["total_livros"] == 5
+    assert m["disponiveis"] == 1
+    assert m["emprestados"] == 3   # 2 com loan + 1 pendente de reconciliação
+    assert m["em_manutencao"] == 1
+    assert m["emprestimos_ativos"] == 2
+    assert m["emprestimos_atrasados"] == 1
+    assert m["leitores"] == 2      # o admin não conta
+    assert m["pendentes_reconciliacao"] == 1
+
+
+def test_indicadores_somam_o_total_de_livros(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    m = get_dashboard_metrics(conn)
+    assert m["disponiveis"] + m["emprestados"] + m["em_manutencao"] == m["total_livros"]
+
+
+def test_indicadores_com_banco_vazio(conn):
+    m = get_dashboard_metrics(conn)
+    assert m == {
+        "total_livros": 0,
+        "disponiveis": 0,
+        "emprestados": 0,
+        "em_manutencao": 0,
+        "emprestimos_ativos": 0,
+        "emprestimos_atrasados": 0,
+        "leitores": 0,
+        "pendentes_reconciliacao": 0,
+    }
+
+
+def test_indicador_de_atraso_respeita_a_data_de_referencia(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    # antes de qualquer vencimento: nenhum atraso
+    assert get_dashboard_metrics(conn, reference_date=date(2019, 1, 1))[
+        "emprestimos_atrasados"
+    ] == 0
+    # depois dos dois vencimentos: os dois atrasados
+    assert get_dashboard_metrics(conn, reference_date=date(2027, 1, 1))[
+        "emprestimos_atrasados"
+    ] == 2
+
+
+def test_emprestimo_sem_prazo_nao_conta_como_atrasado(conn):
+    create_user(conn, "Leitora", "sem@teste.org", "", "senha123", "leitor")
+    code = add_book(conn, "Livro Antigo", "Ana Silva", "Literária")
+    conn.commit()
+    leitor = get_user_by_email(conn, "sem@teste.org")
+    request_loan(conn, _book_by_code(conn, code)["id"], leitor["id"])
+    # empréstimo legado, anterior ao controle de prazo
+    conn.execute(text("UPDATE loans SET due_date = NULL"))
+    conn.commit()
+
+    m = get_dashboard_metrics(conn, reference_date=date(2030, 1, 1))
+    assert m["emprestimos_ativos"] == 1
+    assert m["emprestimos_atrasados"] == 0
+
+
+def test_devolucao_reduz_emprestimos_ativos(acervo_com_indicadores):
+    conn, codes, _ = acervo_com_indicadores
+    book = _book_by_code(conn, codes["Livro Atrasado"])
+    loan = conn.execute(
+        text("SELECT id FROM loans WHERE book_id = :b AND status = 'ativo'"),
+        {"b": book["id"]},
+    ).scalars().first()
+    return_loan(conn, loan)
+    conn.commit()
+
+    m = get_dashboard_metrics(conn, reference_date=date(2026, 6, 1))
+    assert m["emprestimos_ativos"] == 1
+    assert m["emprestimos_atrasados"] == 0
+    assert m["disponiveis"] == 2
+
+
+# --- exportação: catálogo --------------------------------------------------
+
+def test_export_books_csv_cabecalho_e_conteudo(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    raw, rows = _decode_csv(export_books_csv(conn))
+
+    assert rows[0] == ["Código", "Título", "Autor", "Categoria", "Status"]
+    assert len(rows) == 6  # cabeçalho + 5 livros
+
+    por_titulo = {r[1]: r for r in rows[1:]}
+    assert por_titulo["Livro Disponível"][2] == "Ana Silva"
+    assert por_titulo["Livro Disponível"][3] == "Literária"
+    assert por_titulo["Livro Disponível"][4] == "Disponível"
+    assert por_titulo["Livro Em Manutenção"][4] == "Em Manutenção"
+
+
+def test_export_books_csv_usa_bom_e_aspas_em_todos_os_campos(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    data = export_books_csv(conn)
+    assert data.startswith(b"\xef\xbb\xbf")
+
+    raw, _ = _decode_csv(data)
+    primeira_linha = raw.splitlines()[0]
+    assert primeira_linha == '"Código","Título","Autor","Categoria","Status"'
+    # nenhum campo sem aspas em nenhuma linha
+    for linha in raw.splitlines():
+        for campo in linha.split(","):
+            assert campo.startswith('"') or campo.endswith('"'), linha
+
+
+def test_export_books_csv_preserva_acentos(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    raw, _ = _decode_csv(export_books_csv(conn))
+    assert "Livro Em Manutenção" in raw
+    assert "Livro Disponível" in raw
+
+
+def test_export_books_csv_nao_quebra_com_virgula_no_titulo(conn):
+    add_book(conn, "Memórias, Póstumas; e outras", "Ana Silva", "Literária")
+    conn.commit()
+
+    _, rows = _decode_csv(export_books_csv(conn))
+    assert rows[1][1] == "Memórias, Póstumas; e outras"
+    assert len(rows[1]) == 5  # o título com vírgula não criou colunas extras
+
+
+def test_export_books_csv_com_acervo_vazio_traz_so_o_cabecalho(conn):
+    _, rows = _decode_csv(export_books_csv(conn))
+    assert rows == [["Código", "Título", "Autor", "Categoria", "Status"]]
+
+
+# --- exportação: histórico de empréstimos ---------------------------------
+
+def test_export_loans_csv_cabecalho_e_conteudo(acervo_com_indicadores):
+    conn, _, _ = acervo_com_indicadores
+    _, rows = _decode_csv(export_loans_csv(conn))
+
+    assert rows[0] == [
+        "Livro",
+        "Código",
+        "Leitor",
+        "E-mail",
+        "Data do empréstimo",
+        "Devolução prevista",
+        "Data de devolução",
+        "Status",
+    ]
+    assert len(rows) == 3  # cabeçalho + 2 empréstimos
+
+    por_livro = {r[0]: r for r in rows[1:]}
+    atrasado = por_livro["Livro Atrasado"]
+    assert atrasado[2] == "Leitora A"
+    assert atrasado[3] == "a@teste.org"
+    assert atrasado[5] == "2020-01-10"   # devolução prevista
+    assert atrasado[6] == ""             # ainda não devolvido
+    assert atrasado[7] == "ativo"
+
+
+def test_export_loans_csv_inclui_devolucao_registrada(acervo_com_indicadores):
+    conn, codes, _ = acervo_com_indicadores
+    book = _book_by_code(conn, codes["Livro Atrasado"])
+    loan = conn.execute(
+        text("SELECT id FROM loans WHERE book_id = :b AND status = 'ativo'"),
+        {"b": book["id"]},
+    ).scalars().first()
+    return_loan(conn, loan)
+    conn.commit()
+
+    _, rows = _decode_csv(export_loans_csv(conn))
+    devolvido = next(r for r in rows[1:] if r[0] == "Livro Atrasado")
+    assert devolvido[6] != ""          # data de devolução preenchida
+    assert devolvido[7] == "devolvido"
+
+
+def test_export_loans_csv_com_historico_vazio_traz_so_o_cabecalho(conn):
+    _, rows = _decode_csv(export_loans_csv(conn))
+    assert len(rows) == 1
+    assert rows[0][0] == "Livro"
+
+
+def test_export_loans_csv_nao_vaza_dados_de_leitor_removido(acervo_com_indicadores):
+    """Empréstimo órfão (leitor apagado direto no banco) mantém a linha do
+    histórico, mas sem nome nem e-mail da pessoa."""
+    conn, _, leitora = acervo_com_indicadores
+    email = leitora["email"]
+
+    # apaga o leitor contornando a FK, simulando remoção fora do app
+    conn.commit()
+    conn.execute(text("PRAGMA foreign_keys = OFF"))
+    conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": leitora["id"]})
+    conn.commit()
+    conn.execute(text("PRAGMA foreign_keys = ON"))
+
+    raw, rows = _decode_csv(export_loans_csv(conn))
+
+    # as linhas do histórico continuam lá (LEFT JOIN, não INNER)
+    assert len(rows) == 3
+    for linha in rows[1:]:
+        assert linha[2] == app.ANONYMIZED_BORROWER_LABEL
+        assert linha[3] == ""
+
+    # nenhum dado pessoal do leitor removido aparece no arquivo
+    assert email not in raw
+    assert "Leitora A" not in raw

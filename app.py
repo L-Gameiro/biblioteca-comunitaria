@@ -1325,6 +1325,139 @@ def reconcile_mark_returned(conn, book_id) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Painel de indicadores e exportação CSV
+# ---------------------------------------------------------------------------
+
+# Não existe (ainda) remoção de leitor no sistema, então este rótulo é uma
+# proteção defensiva: se um empréstimo ficar órfão (usuário apagado direto no
+# banco), a exportação mostra isto em vez de quebrar ou omitir a linha —
+# nenhum dado pessoal do leitor removido é exposto.
+ANONYMIZED_BORROWER_LABEL = "Leitor removido"
+
+
+def get_dashboard_metrics(conn, reference_date=None) -> dict:
+    """Indicadores do acervo calculados com COUNT/GROUP BY no banco — nenhuma
+    tabela é carregada inteira em memória."""
+    by_status = dict(
+        conn.execute(
+            select(books_table.c.status, func.count()).group_by(books_table.c.status)
+        ).all()
+    )
+
+    total_livros = conn.execute(
+        select(func.count()).select_from(books_table)
+    ).scalar_one()
+
+    emprestimos_ativos = conn.execute(
+        select(func.count())
+        .select_from(loans_table)
+        .where(loans_table.c.status == "ativo")
+    ).scalar_one()
+
+    today = (_to_date(reference_date) or date.today()).isoformat()
+    emprestimos_atrasados = conn.execute(
+        select(func.count())
+        .select_from(loans_table)
+        .where(loans_table.c.status == "ativo")
+        .where(loans_table.c.due_date.isnot(None))
+        .where(loans_table.c.due_date < today)
+    ).scalar_one()
+
+    leitores = conn.execute(
+        select(func.count()).select_from(users_table).where(users_table.c.role == "leitor")
+    ).scalar_one()
+
+    return {
+        "total_livros": total_livros,
+        "disponiveis": by_status.get("Disponível", 0),
+        "emprestados": by_status.get("Emprestado", 0),
+        "em_manutencao": by_status.get("Em Manutenção", 0),
+        "emprestimos_ativos": emprestimos_ativos,
+        "emprestimos_atrasados": emprestimos_atrasados,
+        "leitores": leitores,
+        "pendentes_reconciliacao": count_unreconciled_books(conn),
+    }
+
+
+def _to_excel_csv_bytes(header: list[str], rows) -> bytes:
+    """CSV em UTF-8 com BOM e QUOTE_ALL.
+
+    O BOM faz o Excel em português reconhecer o UTF-8 (sem ele os acentos
+    saem corrompidos) e o QUOTE_ALL evita que um título com ';' ou ','
+    quebre as colunas."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+BOOKS_EXPORT_HEADER = ["Código", "Título", "Autor", "Categoria", "Status"]
+
+
+def export_books_csv(conn) -> bytes:
+    """Catálogo completo em CSV."""
+    rows = conn.execute(
+        select(
+            books_table.c.code,
+            books_table.c.title,
+            books_table.c.author,
+            func.coalesce(books_table.c.category, ""),
+            books_table.c.status,
+        ).order_by(books_table.c.title)
+    ).all()
+    return _to_excel_csv_bytes(BOOKS_EXPORT_HEADER, rows)
+
+
+LOANS_EXPORT_HEADER = [
+    "Livro",
+    "Código",
+    "Leitor",
+    "E-mail",
+    "Data do empréstimo",
+    "Devolução prevista",
+    "Data de devolução",
+    "Status",
+]
+
+
+def export_loans_csv(conn) -> bytes:
+    """Histórico completo de empréstimos em CSV.
+
+    Usa LEFT JOIN em users: um empréstimo cujo leitor não existe mais entra
+    como "Leitor removido", sem e-mail — a linha do histórico é preservada
+    sem expor dados pessoais (com INNER JOIN ela simplesmente sumiria)."""
+    rows = conn.execute(
+        text(
+            """
+            SELECT books.title, books.code,
+                   users.full_name, users.email,
+                   loans.loan_date, loans.due_date, loans.return_date, loans.status
+            FROM loans
+            JOIN books ON books.id = loans.book_id
+            LEFT JOIN users ON users.id = loans.user_id
+            ORDER BY loans.loan_date DESC
+            """
+        )
+    ).mappings().all()
+
+    data = [
+        (
+            r["title"],
+            r["code"],
+            r["full_name"] if r["full_name"] is not None else ANONYMIZED_BORROWER_LABEL,
+            r["email"] or "",
+            r["loan_date"] or "",
+            r["due_date"] or "",
+            r["return_date"] or "",
+            r["status"],
+        )
+        for r in rows
+    ]
+    return _to_excel_csv_bytes(LOANS_EXPORT_HEADER, data)
+
+
 def list_borrowers(conn):
     """Leitores cadastrados, para escolher quem está com o livro."""
     stmt = (
@@ -1571,6 +1704,59 @@ def show_my_loans(conn, user):
             )
 
 
+def show_admin_dashboard(conn):
+    st.header("Painel")
+
+    m = get_dashboard_metrics(conn)
+
+    st.subheader("Acervo")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total de livros", m["total_livros"])
+    col2.metric("🟢 Disponíveis", m["disponiveis"])
+    col3.metric("🔴 Emprestados", m["emprestados"])
+    col4.metric("🟡 Em manutenção", m["em_manutencao"])
+
+    st.subheader("Empréstimos e leitores")
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Empréstimos ativos", m["emprestimos_ativos"])
+    col6.metric("⚠️ Atrasados", m["emprestimos_atrasados"])
+    col7.metric("Leitores cadastrados", m["leitores"])
+    col8.metric("Pendentes de reconciliação", m["pendentes_reconciliacao"])
+
+    if m["emprestimos_atrasados"]:
+        st.warning(
+            f"{m['emprestimos_atrasados']} empréstimo(s) em atraso — veja em "
+            "**Empréstimos**, filtro *Somente atrasados*."
+        )
+    if m["pendentes_reconciliacao"]:
+        st.info(
+            f"{m['pendentes_reconciliacao']} livro(s) marcados como emprestados sem "
+            "registro de quem está com eles — veja em **Reconciliação**."
+        )
+
+    st.subheader("Exportar dados")
+    st.caption(
+        "CSV em UTF-8 com BOM e todos os campos entre aspas — abre direto no "
+        "Excel em português, sem corromper acentos nem quebrar colunas."
+    )
+    hoje = date.today().isoformat()
+    col_books, col_loans = st.columns(2)
+    col_books.download_button(
+        "📚 Catálogo de livros (CSV)",
+        data=export_books_csv(conn),
+        file_name=f"catalogo_livros_{hoje}.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    col_loans.download_button(
+        "📄 Histórico de empréstimos (CSV)",
+        data=export_loans_csv(conn),
+        file_name=f"historico_emprestimos_{hoje}.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+
 def show_loan_reconciliation(conn):
     st.header("Reconciliação de empréstimos")
     st.caption(
@@ -1807,6 +1993,7 @@ def show_app(conn):
             page = st.radio(
                 "Menu",
                 [
+                    "Painel",
                     "Catálogo",
                     "Gestão de Livros",
                     "Empréstimos",
@@ -1821,7 +2008,9 @@ def show_app(conn):
             st.session_state.user = None
             st.rerun()
 
-    if page == "Catálogo":
+    if page == "Painel":
+        show_admin_dashboard(conn)
+    elif page == "Catálogo":
         show_catalog(conn, user)
     elif page == "Gestão de Livros":
         show_book_management(conn)

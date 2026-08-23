@@ -5,7 +5,8 @@
       "Bash(pip3 list *)",
       "Bash(python3 -m pip --version)",
       "Bash(pip3 install *)",
-      "Bash(python3 -c \"import streamlit, pandas, pytest; print\\('streamlit', streamlit.__version__\\); print\\('pandas', pandas.__version__\\); print\\('pytest', pytest.__version__\\)\")"
+      "Bash(python3 -c \"import streamlit, pandas, pytest; print\\('streamlit', streamlit.__version__\\); print\\('pandas', pandas.__version__\\); print\\('pytest', pytest.__version__\\)\")",
+      "Bash(python3 -m pytest test_app.py -q)"
     ]
   }
 }

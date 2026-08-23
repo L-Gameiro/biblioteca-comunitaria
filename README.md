@@ -321,6 +321,40 @@ do CCE) precisa desse passo explícito. **Nenhum dado é perdido**: os
 empréstimos existentes ficam com `due_date` nulo. A migração é idempotente e
 funciona igual em Postgres e SQLite.
 
+## Painel do administrador
+
+Tela inicial do admin, com indicadores calculados por `COUNT`/`GROUP BY` no
+banco (nenhuma tabela é carregada inteira em memória):
+
+| Acervo | Empréstimos e leitores |
+|---|---|
+| Total de livros | Empréstimos ativos |
+| Disponíveis | Atrasados |
+| Emprestados | Leitores cadastrados |
+| Em manutenção | Pendentes de reconciliação |
+
+Alertas aparecem quando há empréstimos em atraso ou livros pendentes de
+reconciliação, apontando para a tela correspondente.
+
+### Exportação em CSV
+
+O painel oferece dois downloads:
+
+- **Catálogo de livros** — código, título, autor, categoria, status.
+- **Histórico de empréstimos** — livro, código, leitor, e-mail, data do
+  empréstimo, devolução prevista, data de devolução e status.
+
+Os arquivos saem em **UTF-8 com BOM** e com **todos os campos entre aspas**
+(`QUOTE_ALL`), para abrir direto no Excel em português: o BOM evita acentos
+corrompidos e as aspas impedem que um título contendo `,` ou `;` quebre as
+colunas.
+
+> **Leitores removidos:** o sistema não tem (ainda) remoção nem anonimização
+> de leitores. A exportação do histórico usa `LEFT JOIN` como proteção: se um
+> empréstimo ficar órfão (usuário apagado direto no banco), a linha é
+> preservada com o rótulo `Leitor removido` e e-mail vazio, em vez de sumir do
+> relatório ou expor dados pessoais.
+
 ## Painéis administrativos de empréstimos
 
 - **Empréstimos ativos**: cada linha mostra também o e-mail e telefone do
