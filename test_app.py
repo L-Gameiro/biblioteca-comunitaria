@@ -30,6 +30,7 @@ from app import (
     apply_column_mapping,
     count_books,
     count_loans_for_book,
+    count_unreconciled_books,
     create_schema,
     create_user,
     days_overdue,
@@ -48,10 +49,14 @@ from app import (
     list_active_loans,
     list_book_categories,
     list_books,
+    list_borrowers,
+    list_unreconciled_books,
     max_numeric_code_for_category,
     normalize_status,
     parse_csv_bytes,
     process_import_rows,
+    reconcile_mark_returned,
+    reconcile_register_loan,
     request_loan,
     return_loan,
     verify_password,
@@ -1573,3 +1578,327 @@ def test_migracao_adiciona_due_date_preservando_emprestimos_existentes(tmp_path)
         assert is_overdue(loan[0]["due_date"], loan[0]["status"]) is False
 
     create_schema(engine)  # idempotente
+
+
+# ---------------------------------------------------------------------------
+# Reconciliação de empréstimos (livros "Emprestado" sem loan ativo)
+# ---------------------------------------------------------------------------
+
+def _set_book_status(conn, code, status):
+    conn.execute(
+        text("UPDATE books SET status = :s WHERE code = :c"), {"s": status, "c": code}
+    )
+    conn.commit()
+
+
+def _book_by_code(conn, code):
+    return conn.execute(
+        text("SELECT * FROM books WHERE code = :c"), {"c": code}
+    ).mappings().first()
+
+
+@pytest.fixture
+def acervo_para_reconciliar(conn):
+    """Cenário da carga inicial:
+      - 2 livros "Emprestado" SEM registro de empréstimo (pendentes)
+      - 1 livro "Emprestado" COM empréstimo ativo (já regular)
+      - 1 livro "Disponível" (nada a fazer)
+    """
+    create_user(conn, "Leitora Rec", "rec@teste.org", "119", "senha123", "leitor")
+    conn.commit()
+
+    codes = {}
+    for titulo, autor in [
+        ("Pendente Um", "Ana Silva"),
+        ("Pendente Dois", "Bruno Costa"),
+        ("Regular", "Carla Dias"),
+        ("Livre", "Diego Souza"),
+    ]:
+        codes[titulo] = add_book(conn, titulo, autor, "Literária")
+    conn.commit()
+
+    # os dois pendentes vieram da planilha já como Emprestado, sem loan
+    _set_book_status(conn, codes["Pendente Um"], "Emprestado")
+    _set_book_status(conn, codes["Pendente Dois"], "Emprestado")
+
+    # o "Regular" tem empréstimo ativo de verdade
+    leitor = get_user_by_email(conn, "rec@teste.org")
+    request_loan(conn, _book_by_code(conn, codes["Regular"])["id"], leitor["id"])
+    conn.commit()
+
+    return conn, codes, leitor
+
+
+# --- listagem --------------------------------------------------------------
+
+def test_lista_apenas_emprestados_sem_loan_ativo(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    titulos = sorted(r["title"] for r in list_unreconciled_books(conn))
+    assert titulos == ["Pendente Dois", "Pendente Um"]
+
+
+def test_contagem_total_pendente(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    assert count_unreconciled_books(conn) == 2
+
+
+def test_livro_com_emprestimo_ativo_nao_aparece(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    assert "Regular" not in {r["title"] for r in list_unreconciled_books(conn)}
+
+
+def test_livro_disponivel_nao_aparece(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    assert "Livre" not in {r["title"] for r in list_unreconciled_books(conn)}
+
+
+def test_emprestimo_devolvido_volta_a_contar_como_pendente(acervo_para_reconciliar):
+    """Devolução registrada zera o loan ativo; se o livro seguir 'Emprestado'
+    por inconsistência, ele reaparece como pendente."""
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Regular"])
+    loan = conn.execute(
+        text("SELECT id FROM loans WHERE book_id = :b AND status = 'ativo'"),
+        {"b": book["id"]},
+    ).scalars().first()
+    return_loan(conn, loan)
+    conn.commit()
+    _set_book_status(conn, codes["Regular"], "Emprestado")
+
+    assert "Regular" in {r["title"] for r in list_unreconciled_books(conn)}
+
+
+def test_busca_e_paginacao_da_reconciliacao(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    assert count_unreconciled_books(conn, query="Pendente Um") == 1
+    assert [r["title"] for r in list_unreconciled_books(conn, query="Pendente Um")] == [
+        "Pendente Um"
+    ]
+    # busca sem acento/caixa igual ao resto do sistema
+    assert count_unreconciled_books(conn, query="pendente") == 2
+    # paginação
+    page = list_unreconciled_books(conn, limit=1, offset=0)
+    assert len(page) == 1
+    assert len(list_unreconciled_books(conn, limit=1, offset=1)) == 1
+    assert list_unreconciled_books(conn, limit=1, offset=5) == []
+
+
+def test_list_borrowers_traz_somente_leitores(acervo_para_reconciliar):
+    conn, _, _ = acervo_para_reconciliar
+    borrowers = list_borrowers(conn)
+    assert [b["email"] for b in borrowers] == ["rec@teste.org"]  # admin fora
+
+
+# --- ação 1: registrar empréstimo -----------------------------------------
+
+def test_registrar_emprestimo_cria_loan_e_mantem_status(acervo_para_reconciliar):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    loan = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :b"), {"b": book["id"]}
+    ).mappings().first()
+    assert loan is not None
+    assert loan["status"] == "ativo"
+    assert loan["user_id"] == leitor["id"]
+    assert loan["due_date"]  # prazo preenchido
+
+    # o livro continua com o leitor -> segue Emprestado
+    assert _book_by_code(conn, codes["Pendente Um"])["status"] == "Emprestado"
+    # e sai da lista de pendentes
+    assert "Pendente Um" not in {r["title"] for r in list_unreconciled_books(conn)}
+    assert count_unreconciled_books(conn) == 1
+
+
+def test_registrar_emprestimo_aceita_data_e_prazo_informados(acervo_para_reconciliar):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_register_loan(
+        conn,
+        book["id"],
+        leitor["id"],
+        loan_date=date(2026, 3, 1),
+        due_date=date(2026, 3, 20),
+    )
+    conn.commit()
+
+    loan = conn.execute(
+        text("SELECT loan_date, due_date FROM loans WHERE book_id = :b"),
+        {"b": book["id"]},
+    ).mappings().first()
+    assert loan["loan_date"] == "2026-03-01"
+    assert loan["due_date"] == "2026-03-20"
+
+
+def test_registrar_emprestimo_sem_prazo_aplica_prazo_padrao(acervo_para_reconciliar):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_register_loan(conn, book["id"], leitor["id"], loan_date=date(2026, 3, 1))
+    conn.commit()
+
+    due = conn.execute(
+        text("SELECT due_date FROM loans WHERE book_id = :b"), {"b": book["id"]}
+    ).scalars().first()
+    assert due == (date(2026, 3, 1) + timedelta(days=app.PRAZO_PADRAO_DIAS)).isoformat()
+
+
+def test_registrar_emprestimo_o_torna_visivel_em_emprestimos_ativos(
+    acervo_para_reconciliar,
+):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+    assert "Pendente Um" not in {r["title"] for r in list_active_loans(conn)}
+
+    reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    assert "Pendente Um" in {r["title"] for r in list_active_loans(conn)}
+
+
+def test_registrar_emprestimo_com_leitor_inexistente_falha(acervo_para_reconciliar):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    with pytest.raises(ValueError, match="Leitor"):
+        reconcile_register_loan(conn, book["id"], 9999)
+    conn.rollback()
+
+    # nada foi criado
+    assert count_loans_for_book(conn, book["id"]) == 0
+
+
+# --- ação 2: marcar como devolvido ----------------------------------------
+
+def test_marcar_como_devolvido_libera_o_livro_sem_criar_loan(acervo_para_reconciliar):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_mark_returned(conn, book["id"])
+    conn.commit()
+
+    assert _book_by_code(conn, codes["Pendente Um"])["status"] == "Disponível"
+    assert count_loans_for_book(conn, book["id"]) == 0  # sem histórico inventado
+    assert count_unreconciled_books(conn) == 1
+
+
+# --- concorrência: já reconciliado por outra sessão ------------------------
+
+def test_registrar_falha_se_outra_sessao_ja_marcou_como_devolvido(
+    acervo_para_reconciliar,
+):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    # outra sessão liberou o livro entre o carregamento da tela e a confirmação
+    reconcile_mark_returned(conn, book["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="não está mais como 'Emprestado'"):
+        reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.rollback()
+
+    assert count_loans_for_book(conn, book["id"]) == 0
+
+
+def test_registrar_falha_se_outra_sessao_ja_registrou_o_emprestimo(
+    acervo_para_reconciliar,
+):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="já tem um empréstimo ativo"):
+        reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.rollback()
+
+    # continua com um único empréstimo, sem duplicata
+    assert count_loans_for_book(conn, book["id"]) == 1
+
+
+def test_marcar_devolvido_falha_se_outra_sessao_ja_registrou_emprestimo(
+    acervo_para_reconciliar,
+):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_register_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="já tem um empréstimo ativo"):
+        reconcile_mark_returned(conn, book["id"])
+    conn.rollback()
+
+    # o livro segue emprestado e o registro permanece
+    assert _book_by_code(conn, codes["Pendente Um"])["status"] == "Emprestado"
+    assert count_loans_for_book(conn, book["id"]) == 1
+
+
+def test_marcar_devolvido_falha_se_outra_sessao_ja_liberou(acervo_para_reconciliar):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    reconcile_mark_returned(conn, book["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="não está mais como 'Emprestado'"):
+        reconcile_mark_returned(conn, book["id"])
+    conn.rollback()
+
+
+def test_acao_em_livro_removido_falha_com_mensagem_clara(acervo_para_reconciliar):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+    conn.execute(text("DELETE FROM books WHERE id = :id"), {"id": book["id"]})
+    conn.commit()
+
+    with pytest.raises(ValueError, match="não encontrado"):
+        reconcile_mark_returned(conn, book["id"])
+    conn.rollback()
+
+
+def test_conflito_real_entre_duas_conexoes_simultaneas(tmp_path):
+    """Duas sessões de admin abertas ao mesmo tempo (conexões distintas):
+    a segunda precisa falhar ao confirmar sobre um livro já reconciliado
+    pela primeira, em vez de duplicar o empréstimo."""
+    database_url = f"sqlite:///{tmp_path}/concorrencia.db"
+    engine = get_engine(database_url)
+    create_schema(engine)
+
+    setup = get_connection(database_url)
+    create_user(setup, "Leitora", "dupla@teste.org", "", "senha123", "leitor")
+    code = add_book(setup, "Livro Disputado", "Ana Silva", "Literária")
+    setup.commit()
+    _set_book_status(setup, code, "Emprestado")
+    book_id = _book_by_code(setup, code)["id"]
+    leitor_id = get_user_by_email(setup, "dupla@teste.org")["id"]
+    setup.close()
+
+    admin_a = get_connection(database_url)
+    admin_b = get_connection(database_url)
+    try:
+        # os dois carregaram a tela e veem o mesmo livro pendente
+        assert count_unreconciled_books(admin_a) == 1
+        assert count_unreconciled_books(admin_b) == 1
+
+        # admin A confirma primeiro
+        reconcile_register_loan(admin_a, book_id, leitor_id)
+        admin_a.commit()
+
+        # admin B confirma depois, sobre um estado já obsoleto
+        with pytest.raises(ValueError, match="já tem um empréstimo ativo"):
+            reconcile_register_loan(admin_b, book_id, leitor_id)
+        admin_b.rollback()
+
+        # exatamente um empréstimo, sem duplicata
+        assert count_loans_for_book(admin_a, book_id) == 1
+        assert count_unreconciled_books(admin_a) == 0
+    finally:
+        admin_a.close()
+        admin_b.close()

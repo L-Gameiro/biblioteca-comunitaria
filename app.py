@@ -1197,6 +1197,144 @@ def show_book_management(conn):
                         st.error(f"Não foi possível remover o livro: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Reconciliação: livros marcados como "Emprestado" sem empréstimo registrado
+# (vieram assim da carga inicial, com o nome de quem pegou só na planilha)
+# ---------------------------------------------------------------------------
+
+def _unreconciled_where(query: str = ""):
+    """Livro com status 'Emprestado' e sem NENHUM empréstimo ativo na base."""
+    active_loan_exists = (
+        select(loans_table.c.id)
+        .where(loans_table.c.book_id == books_table.c.id)
+        .where(loans_table.c.status == "ativo")
+        .exists()
+    )
+    clauses = [books_table.c.status == "Emprestado", ~active_loan_exists]
+
+    term = normalize_search_term(query)
+    if term:
+        pattern = f"%{term}%"
+        searchable = (
+            books_table.c.title,
+            books_table.c.author,
+            books_table.c.code,
+            func.coalesce(books_table.c.category, ""),
+        )
+        clauses.append(
+            or_(*[_sql_unaccent(col).ilike(pattern) for col in searchable])
+        )
+    return clauses
+
+
+def count_unreconciled_books(conn, query: str = "") -> int:
+    stmt = select(func.count()).select_from(books_table)
+    for clause in _unreconciled_where(query):
+        stmt = stmt.where(clause)
+    return conn.execute(stmt).scalar_one()
+
+
+def list_unreconciled_books(
+    conn, query: str = "", limit: int = BOOKS_PAGE_SIZE, offset: int = 0
+):
+    stmt = select(books_table)
+    for clause in _unreconciled_where(query):
+        stmt = stmt.where(clause)
+    stmt = stmt.order_by(books_table.c.title).limit(limit).offset(offset)
+    return conn.execute(stmt).mappings().all()
+
+
+def _lock_unreconciled_book(conn, book_id):
+    """Revalida o livro no momento da execução e o trava para escrita.
+
+    Devolve a linha do livro; levanta ValueError se ele já tiver sido
+    reconciliado por outra sessão entre o carregamento da tela e a
+    confirmação. with_for_update() vira FOR UPDATE no Postgres (trava a
+    linha) e é ignorado no SQLite, onde a transação já serializa a escrita.
+    """
+    book = conn.execute(
+        select(books_table).where(books_table.c.id == book_id).with_for_update()
+    ).mappings().first()
+
+    if book is None:
+        raise ValueError("Livro não encontrado — ele pode ter sido removido.")
+    if book["status"] != "Emprestado":
+        raise ValueError(
+            f"Este livro não está mais como 'Emprestado' (agora está "
+            f"'{book['status']}'). Outra pessoa já o reconciliou."
+        )
+    if get_active_loan_for_book(conn, book_id) is not None:
+        raise ValueError(
+            "Este livro já tem um empréstimo ativo registrado — "
+            "outra pessoa já o reconciliou."
+        )
+    return book
+
+
+def reconcile_register_loan(conn, book_id, user_id, loan_date=None, due_date=None):
+    """Regulariza o livro criando o empréstimo ativo que faltava.
+
+    O status do livro continua 'Emprestado' (ele segue fisicamente com o
+    leitor) — o que muda é que agora existe registro de quem está com ele.
+    """
+    _lock_unreconciled_book(conn, book_id)
+
+    borrower = conn.execute(
+        select(users_table).where(users_table.c.id == user_id)
+    ).mappings().first()
+    if borrower is None:
+        raise ValueError("Leitor não encontrado.")
+
+    loan_day = _to_date(loan_date)
+    loan_value = (
+        loan_day.isoformat()
+        if loan_day
+        else datetime.now().isoformat(timespec="seconds")
+    )
+    due = _to_date(due_date) or default_due_date(loan_value)
+
+    conn.execute(
+        text(
+            "INSERT INTO loans (book_id, user_id, loan_date, due_date, status) "
+            "VALUES (:book_id, :user_id, :loan_date, :due_date, 'ativo')"
+        ),
+        {
+            "book_id": book_id,
+            "user_id": user_id,
+            "loan_date": loan_value,
+            "due_date": due.isoformat(),
+        },
+    )
+
+
+def reconcile_mark_returned(conn, book_id) -> None:
+    """O livro voltou fisicamente: libera para o catálogo sem inventar
+    histórico de empréstimo (não sabemos quem estava com ele)."""
+    _lock_unreconciled_book(conn, book_id)
+
+    result = conn.execute(
+        text(
+            "UPDATE books SET status = 'Disponível' "
+            "WHERE id = :id AND status = 'Emprestado'"
+        ),
+        {"id": book_id},
+    )
+    if result.rowcount == 0:
+        raise ValueError(
+            "Não foi possível liberar o livro: o status mudou durante a operação."
+        )
+
+
+def list_borrowers(conn):
+    """Leitores cadastrados, para escolher quem está com o livro."""
+    stmt = (
+        select(users_table)
+        .where(users_table.c.role == "leitor")
+        .order_by(users_table.c.full_name)
+    )
+    return conn.execute(stmt).mappings().all()
+
+
 def list_active_loans(conn, only_overdue: bool = False, reference_date=None):
     """Empréstimos ativos com dados de contato do leitor e prazo.
 
@@ -1433,6 +1571,111 @@ def show_my_loans(conn, user):
             )
 
 
+def show_loan_reconciliation(conn):
+    st.header("Reconciliação de empréstimos")
+    st.caption(
+        "Livros marcados como **Emprestado** que não têm empréstimo registrado no "
+        "sistema — vieram assim da carga inicial do acervo. Regularize indicando "
+        "quem está com o livro, ou marque como devolvido se ele já voltou."
+    )
+
+    query = st.text_input(
+        "Buscar por título, autor, código ou categoria", key="reconcile_query"
+    )
+
+    signature_key = "reconcile_filter_signature"
+    if st.session_state.get(signature_key) != query:
+        st.session_state[signature_key] = query
+        st.session_state["reconcile_page"] = 1
+
+    total = count_unreconciled_books(conn, query)
+    total_geral = count_unreconciled_books(conn)
+    st.metric("Pendentes de reconciliação", total_geral)
+
+    if not total:
+        st.success(
+            "Nenhum livro pendente de reconciliação."
+            if not query
+            else "Nenhum livro pendente corresponde à busca."
+        )
+        return
+
+    borrowers = list_borrowers(conn)
+    if not borrowers:
+        st.warning(
+            "Nenhum leitor cadastrado ainda — só é possível marcar como devolvido. "
+            "Cadastre o leitor para poder registrar o empréstimo."
+        )
+    borrower_labels = {f"{b['full_name']} ({b['email']})": b["id"] for b in borrowers}
+
+    offset = _paginate(total, "reconcile")
+    rows = list_unreconciled_books(conn, query, offset=offset)
+
+    for r in rows:
+        with st.container(border=True):
+            st.markdown(f"**{r['title']}** ({r['code']})")
+            st.caption(f"{r['author']} · {r['category'] or 'sem categoria'}")
+
+            col_loan, col_return = st.columns(2)
+
+            with col_loan:
+                with st.popover("📝 Registrar empréstimo", width="stretch"):
+                    if not borrower_labels:
+                        st.info("Cadastre um leitor primeiro.")
+                    else:
+                        who = st.selectbox(
+                            "Quem está com o livro",
+                            list(borrower_labels.keys()),
+                            key=f"rec_user_{r['id']}",
+                        )
+                        loan_day = st.date_input(
+                            "Data do empréstimo",
+                            value=date.today(),
+                            key=f"rec_loan_date_{r['id']}",
+                        )
+                        due = st.date_input(
+                            "Devolução prevista",
+                            value=default_due_date(),
+                            key=f"rec_due_{r['id']}",
+                        )
+                        if st.button(
+                            "Confirmar registro",
+                            key=f"rec_confirm_{r['id']}",
+                            width="stretch",
+                        ):
+                            try:
+                                reconcile_register_loan(
+                                    conn,
+                                    r["id"],
+                                    borrower_labels[who],
+                                    loan_date=loan_day,
+                                    due_date=due,
+                                )
+                                conn.commit()
+                                st.success(
+                                    f'Empréstimo de "{r["title"]}" registrado para {who}.'
+                                )
+                                st.rerun()
+                            except (ValueError, IntegrityError) as exc:
+                                conn.rollback()
+                                st.error(str(exc))
+
+            with col_return:
+                if st.button(
+                    "✅ Marcar como devolvido",
+                    key=f"rec_returned_{r['id']}",
+                    width="stretch",
+                ):
+                    try:
+                        reconcile_mark_returned(conn, r["id"])
+                        conn.commit()
+                        st.success(f'"{r["title"]}" liberado no catálogo.')
+                        st.rerun()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(str(exc))
+
+
 def show_csv_import(conn):
     st.header("Importar carga de livros (CSV)")
     st.caption(
@@ -1567,6 +1810,7 @@ def show_app(conn):
                     "Catálogo",
                     "Gestão de Livros",
                     "Empréstimos",
+                    "Reconciliação",
                     "Histórico completo",
                     "Importar CSV",
                 ],
@@ -1583,6 +1827,8 @@ def show_app(conn):
         show_book_management(conn)
     elif page == "Empréstimos":
         show_loan_management(conn)
+    elif page == "Reconciliação":
+        show_loan_reconciliation(conn)
     elif page == "Histórico completo":
         show_admin_loan_history(conn)
     elif page == "Meus Empréstimos":

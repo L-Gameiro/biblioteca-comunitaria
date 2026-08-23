@@ -127,8 +127,10 @@ borda do `bookCode.test.ts`), a estratégia de código por acervo
 (`detect_column_mapping`, `apply_column_mapping`, `normalize_status`), a busca
 com filtros e paginação no banco (`count_books`, `list_books`,
 `list_book_categories`), o prazo de devolução e o controle de atraso
-(`default_due_date`, `days_overdue`, `is_overdue`, `list_active_loans`),
-inicialização do schema e do admin padrão
+(`default_due_date`, `days_overdue`, `is_overdue`, `list_active_loans`), a
+reconciliação de empréstimos, incluindo o conflito entre duas sessões
+simultâneas (`list_unreconciled_books`, `reconcile_register_loan`,
+`reconcile_mark_returned`), inicialização do schema e do admin padrão
 (`init_db`), o fluxo de empréstimo/devolução e a
 remoção de livros (`delete_book`).
 
@@ -328,3 +330,28 @@ funciona igual em Postgres e SQLite.
   usuário e por período (data de empréstimo). Ao selecionar um usuário
   específico no filtro, um painel abaixo mostra todo o histórico daquele
   usuário (livro, datas de empréstimo/devolução e status).
+
+## Reconciliação de empréstimos
+
+A carga inicial do acervo trouxe centenas de livros com status **Emprestado**
+mas sem nenhum registro na tabela `loans` — a planilha de origem tinha o nome
+de quem pegou o livro, mas essas pessoas não são usuárias do sistema. Esses
+livros ficavam num limbo: indisponíveis no catálogo, porém ausentes de
+"Empréstimos ativos", sem ninguém saber quem está com eles.
+
+A tela **Reconciliação** (menu do admin) lista exatamente esses casos — livros
+com status `Emprestado` **e** sem nenhum empréstimo ativo registrado — com a
+contagem total pendente, busca (mesma busca sem acento do resto do sistema) e
+paginação de 25 itens. Para cada livro, duas ações:
+
+| Ação | O que faz |
+|---|---|
+| **📝 Registrar empréstimo** | Escolhe um leitor cadastrado, a data do empréstimo e a devolução prevista (prazo padrão pré-preenchido), e cria o empréstimo ativo que faltava. O livro **continua `Emprestado`** — ele segue fisicamente com o leitor; o que muda é que agora existe registro de quem está com ele, e ele passa a aparecer em "Empréstimos ativos". |
+| **✅ Marcar como devolvido** | O livro já voltou fisicamente: muda o status para `Disponível` e **não cria registro de empréstimo** (não sabemos quem estava com ele, e inventar histórico seria pior que não ter). |
+
+As duas ações rodam em transação e **revalidam o estado do livro no momento da
+execução**, não no momento em que a tela foi carregada. Se outro admin agir
+sobre o mesmo livro em paralelo, a segunda confirmação falha com mensagem
+explicativa em vez de duplicar o empréstimo ou sobrescrever a ação anterior. No
+Postgres a revalidação usa `SELECT ... FOR UPDATE` (trava a linha); no SQLite o
+`FOR UPDATE` é ignorado pelo dialeto e a própria transação serializa a escrita.
