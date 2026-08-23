@@ -29,7 +29,6 @@ import re
 import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta
-from functools import lru_cache
 
 import streamlit as st
 from sqlalchemy import (
@@ -40,6 +39,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    case,
     create_engine,
     func,
     inspect,
@@ -175,13 +175,26 @@ def _get_database_url_from_secrets() -> str:
         ) from exc
 
 
-@lru_cache(maxsize=8)
+@st.cache_resource(show_spinner=False)
 def _build_engine(database_url: str) -> Engine:
+    """Engine (e seu pool de conexões) reaproveitado entre reruns e sessões.
+
+    Precisa ser st.cache_resource, e não lru_cache: o Streamlit executa cada
+    rerun em um módulo NOVO, então qualquer cache de módulo nasce vazio e um
+    engine — com pool novo e handshake TCP/TLS novo — seria criado a cada
+    clique do usuário. O Engine é thread-safe e pode ser compartilhado.
+
+    Só o Engine é cacheado. Objetos Connection JAMAIS podem entrar aqui:
+    carregam estado transacional e seriam compartilhados entre sessões e
+    threads, misturando commits e rollbacks de usuários diferentes.
+    """
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
     return create_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
 
 
 def get_engine(database_url: str | None = None) -> Engine:
+    # a URL é resolvida ANTES de cachear, para que a chave do cache seja o
+    # banco de verdade e não o None do argumento omitido
     return _build_engine(database_url or _get_database_url_from_secrets())
 
 
@@ -228,14 +241,21 @@ def create_schema(engine: Engine) -> None:
     _migrate_add_loans_due_date(engine)
 
 
-_initialized_engine_ids: set[int] = set()
+@st.cache_resource(show_spinner=False)
+def _ensure_initialized(database_url: str) -> bool:
+    """Prepara o banco uma única vez por processo.
 
+    Precisa ser st.cache_resource pelo mesmo motivo do engine: um guard em
+    variável de módulo nunca pega, porque o Streamlit executa cada rerun em um
+    módulo novo — e a criação de schema + inspeção da migração custava 6
+    consultas em TODA interação, até na tela de login.
 
-def init_db(database_url: str | None = None) -> None:
+    Continua idempotente: create_all só cria o que falta, a migração só roda
+    se a coluna não existir e o admin só é criado se não houver usuário. Isso
+    importa porque o Streamlit Cloud hiberna o app — quando o container
+    reinicia, o cache nasce vazio e esta função roda de novo.
+    """
     engine = get_engine(database_url)
-    if id(engine) in _initialized_engine_ids:
-        return
-
     create_schema(engine)
     with get_connection(database_url) as conn:
         # Só o admin padrão é criado automaticamente — necessário para o
@@ -246,8 +266,11 @@ def init_db(database_url: str | None = None) -> None:
                 conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin"
             )
             conn.commit()
+    return True
 
-    _initialized_engine_ids.add(id(engine))
+
+def init_db(database_url: str | None = None) -> None:
+    _ensure_initialized(database_url or _get_database_url_from_secrets())
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +448,33 @@ def count_loans_for_book(conn, book_id) -> int:
         text("SELECT COUNT(*) AS n FROM loans WHERE book_id = :book_id"),
         {"book_id": book_id},
     ).mappings().first()["n"]
+
+
+def loan_summary_for_books(conn, book_ids) -> dict:
+    """Resumo de empréstimos de VÁRIOS livros em uma única query.
+
+    Devolve {book_id: {"total": n, "ativos": n}} — exatamente o que a listagem
+    da Gestão de Livros precisa por livro (se está emprestado agora e quantos
+    registros seriam apagados junto na remoção), sem pagar uma consulta por
+    livro exibido. Livros sem nenhum empréstimo vêm com zeros.
+    """
+    ids = list(book_ids)
+    if not ids:
+        return {}
+    rows = conn.execute(
+        select(
+            loans_table.c.book_id,
+            func.count().label("total"),
+            func.sum(case((loans_table.c.status == "ativo", 1), else_=0)).label("ativos"),
+        )
+        .where(loans_table.c.book_id.in_(ids))
+        .group_by(loans_table.c.book_id)
+    ).all()
+
+    summary = {book_id: {"total": 0, "ativos": 0} for book_id in ids}
+    for book_id, total, ativos in rows:
+        summary[book_id] = {"total": int(total), "ativos": int(ativos or 0)}
+    return summary
 
 
 def delete_book(conn, book_id) -> None:
@@ -1124,6 +1174,8 @@ def show_book_management(conn):
 
     offset = _paginate(total, "manage")
     rows = list_books(conn, query, category, status, offset=offset, newest_first=True)
+    # uma única agregação para a página inteira, em vez de 2 queries por livro
+    loan_summary = loan_summary_for_books(conn, [r["id"] for r in rows])
 
     for r in rows:
         with st.expander(f"{r['code']} — {r['title']}"):
@@ -1158,10 +1210,11 @@ def show_book_management(conn):
                     st.rerun()
 
             st.markdown("---")
-            active_loan = get_active_loan_for_book(conn, r["id"])
-            loan_count = count_loans_for_book(conn, r["id"])
+            summary = loan_summary.get(r["id"], {"total": 0, "ativos": 0})
+            has_active_loan = summary["ativos"] > 0
+            loan_count = summary["total"]
 
-            if active_loan is not None:
+            if has_active_loan:
                 st.error(
                     "Este livro está emprestado no momento. Registre a devolução "
                     "antes de removê-lo."

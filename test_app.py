@@ -48,6 +48,7 @@ from app import (
     get_csv_columns,
     get_engine,
     get_user_by_email,
+    get_active_loan_for_book,
     init_db,
     is_overdue,
     is_valid_email,
@@ -55,6 +56,7 @@ from app import (
     list_book_categories,
     list_books,
     list_borrowers,
+    loan_summary_for_books,
     list_unreconciled_books,
     max_numeric_code_for_category,
     normalize_status,
@@ -560,7 +562,11 @@ def test_resumo_estatistico_mistura_mantidos_gerados_e_erros(conn):
 def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
     database_url = f"sqlite:///{tmp_path}/init.db"
     init_db(database_url)
-    init_db(database_url)  # chamado 2x, como acontece a cada rerun do Streamlit
+    # limpar o cache entre as chamadas garante que a inicializacao roda MESMO
+    # de novo (senao o st.cache_resource curto-circuitaria e o teste nao
+    # provaria idempotencia nenhuma) — equivale ao restart do container
+    app._ensure_initialized.clear()
+    init_db(database_url)  # 2a execucao real, como num restart do Streamlit Cloud
 
     with get_connection(database_url) as connection:
         admin = get_user_by_email(connection, "admin@biblioteca.org")
@@ -595,8 +601,8 @@ def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path):
         add_book(connection, "Livro Real do Acervo", "Machado de Assis", "Literária")
         connection.commit()
 
-    # simula um restart: limpa o cache de engines já inicializados
-    app._initialized_engine_ids.clear()
+    # simula um restart do container: o cache de inicialização nasce vazio
+    app._ensure_initialized.clear()
     init_db(database_url)
 
     with get_connection(database_url) as connection:
@@ -2165,3 +2171,113 @@ def test_export_loans_csv_nao_vaza_dados_de_leitor_removido(acervo_com_indicador
     # nenhum dado pessoal do leitor removido aparece no arquivo
     assert email not in raw
     assert "Leitora A" not in raw
+
+
+# ---------------------------------------------------------------------------
+# loan_summary_for_books — agregação que substituiu o N+1 da Gestão de Livros
+# ---------------------------------------------------------------------------
+
+def test_loan_summary_livro_sem_emprestimo_vem_zerado(conn):
+    code = add_book(conn, "Sem Historico", "Ana Silva", "Literária")
+    conn.commit()
+    book = _book_by_code(conn, code)
+
+    assert loan_summary_for_books(conn, [book["id"]]) == {
+        book["id"]: {"total": 0, "ativos": 0}
+    }
+
+
+def test_loan_summary_conta_ativos_e_total(conn):
+    create_user(conn, "Leitora", "sum@teste.org", "", "senha123", "leitor")
+    code = add_book(conn, "Com Historico", "Ana Silva", "Literária")
+    conn.commit()
+    leitor = get_user_by_email(conn, "sum@teste.org")
+    book = _book_by_code(conn, code)
+
+    # dois ciclos devolvidos + um ativo = total 3, ativos 1
+    for _ in range(2):
+        request_loan(conn, book["id"], leitor["id"])
+        conn.commit()
+        loan = conn.execute(
+            text("SELECT id FROM loans WHERE book_id=:b AND status='ativo'"),
+            {"b": book["id"]},
+        ).scalars().first()
+        return_loan(conn, loan)
+        conn.commit()
+    request_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    assert loan_summary_for_books(conn, [book["id"]]) == {
+        book["id"]: {"total": 3, "ativos": 1}
+    }
+
+
+def test_loan_summary_lista_vazia_nao_consulta_o_banco(conn):
+    assert loan_summary_for_books(conn, []) == {}
+
+
+def test_loan_summary_equivale_as_funcoes_por_livro_que_substituiu(conn):
+    """Garante que a agregação em lote devolve exatamente a mesma informação
+    que as duas consultas por livro usadas antes."""
+    create_user(conn, "Leitora", "eq@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "eq@teste.org")
+
+    # nomes alfabeticamente distintos: "Autor 1"/"Autor 2" gerariam o MESMO
+    # codigo (digitos nao entram na regra) e colidiriam no UNIQUE
+    autores = ["Ana Silva", "Bruno Costa", "Carla Dias", "Diego Souza", "Elena Rocha"]
+    codes = [add_book(conn, f"Livro {i}", autores[i], "Literária") for i in range(5)]
+    conn.commit()
+    books = [_book_by_code(conn, c) for c in codes]
+
+    # livro 0: nada | livro 1: ativo | livro 2: devolvido | livro 3: devolvido+ativo
+    request_loan(conn, books[1]["id"], leitor["id"])
+    conn.commit()
+    for idx in (2, 3):
+        request_loan(conn, books[idx]["id"], leitor["id"])
+        conn.commit()
+        loan = conn.execute(
+            text("SELECT id FROM loans WHERE book_id=:b AND status='ativo'"),
+            {"b": books[idx]["id"]},
+        ).scalars().first()
+        return_loan(conn, loan)
+        conn.commit()
+    request_loan(conn, books[3]["id"], leitor["id"])
+    conn.commit()
+
+    summary = loan_summary_for_books(conn, [b["id"] for b in books])
+    for b in books:
+        esperado_ativo = get_active_loan_for_book(conn, b["id"]) is not None
+        esperado_total = count_loans_for_book(conn, b["id"])
+        assert (summary[b["id"]]["ativos"] > 0) is esperado_ativo, b["code"]
+        assert summary[b["id"]]["total"] == esperado_total, b["code"]
+
+
+def test_loan_summary_uma_unica_query_para_a_pagina_inteira(conn):
+    """O ponto da otimização: 25 livros custam 1 query, não 50."""
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    for i in range(25):
+        conn.execute(
+            text(
+                "INSERT INTO books (code,title,author,category,status,created_at) "
+                "VALUES (:c,:t,'Autor X','Literária','Disponível','2026-01-01')"
+            ),
+            {"c": f"SUM-{i:03d}", "t": f"Pag {i}"},
+        )
+    conn.commit()
+    ids = [_book_by_code(conn, f"SUM-{i:03d}")["id"] for i in range(25)]
+
+    contador = {"n": 0}
+
+    def _conta(*a, **k):
+        contador["n"] += 1
+
+    event.listen(Engine, "before_cursor_execute", _conta)
+    try:
+        loan_summary_for_books(conn, ids)
+    finally:
+        event.remove(Engine, "before_cursor_execute", _conta)
+
+    assert contador["n"] == 1
