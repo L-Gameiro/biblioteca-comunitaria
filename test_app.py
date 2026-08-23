@@ -13,6 +13,8 @@ Os testes usam SQLite local descartável através da mesma camada SQLAlchemy
 usada em produção (Postgres/Supabase) — não dependem de acesso de rede.
 """
 
+from datetime import date, timedelta
+
 import pytest
 from sqlalchemy import text
 
@@ -30,6 +32,8 @@ from app import (
     count_loans_for_book,
     create_schema,
     create_user,
+    days_overdue,
+    default_due_date,
     delete_book,
     detect_column_mapping,
     generate_book_code,
@@ -39,7 +43,9 @@ from app import (
     get_engine,
     get_user_by_email,
     init_db,
+    is_overdue,
     is_valid_email,
+    list_active_loans,
     list_book_categories,
     list_books,
     max_numeric_code_for_category,
@@ -1343,3 +1349,227 @@ def test_apenas_a_pagina_solicitada_e_trazida_do_banco(acervo_grande):
     """O ponto do requisito: filtrar/paginar no SQL, não em Python."""
     assert len(list_books(acervo_grande, limit=25, offset=0)) == 25
     assert len(list_books(acervo_grande, limit=5, offset=0)) == 5
+
+
+# ---------------------------------------------------------------------------
+# Prazo de devolução e controle de atraso
+# ---------------------------------------------------------------------------
+
+HOJE = date(2026, 6, 15)
+
+
+def test_prazo_padrao_e_de_14_dias():
+    assert app.PRAZO_PADRAO_DIAS == 14
+
+
+def test_default_due_date_soma_o_prazo_padrao_a_data_do_emprestimo():
+    assert default_due_date(date(2026, 6, 1)) == date(2026, 6, 15)
+    # aceita string ISO e datetime, como vem do banco
+    assert default_due_date("2026-06-01") == date(2026, 6, 15)
+    assert default_due_date("2026-06-01T10:30:00") == date(2026, 6, 15)
+
+
+def test_default_due_date_sem_argumento_parte_de_hoje():
+    assert default_due_date() == date.today() + timedelta(days=app.PRAZO_PADRAO_DIAS)
+
+
+def test_request_loan_aplica_prazo_padrao(conn):
+    create_user(conn, "Leitor Prazo", "prazo@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "prazo@teste.org")
+    code = add_book(conn, "Livro Prazo", "Autor Prazo", "Literária")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :c"), {"c": code}
+    ).mappings().first()
+
+    request_loan(conn, book["id"], leitor["id"])
+    conn.commit()
+
+    loan = conn.execute(
+        text("SELECT loan_date, due_date FROM loans WHERE book_id = :b"),
+        {"b": book["id"]},
+    ).mappings().first()
+    esperado = date.fromisoformat(loan["loan_date"][:10]) + timedelta(
+        days=app.PRAZO_PADRAO_DIAS
+    )
+    assert loan["due_date"] == esperado.isoformat()
+
+
+def test_request_loan_aceita_prazo_ajustado_manualmente(conn):
+    create_user(conn, "Leitor Ajuste", "ajuste@teste.org", "", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "ajuste@teste.org")
+    code = add_book(conn, "Livro Ajuste", "Autor Ajuste", "Literária")
+    conn.commit()
+    book = conn.execute(
+        text("SELECT * FROM books WHERE code = :c"), {"c": code}
+    ).mappings().first()
+
+    request_loan(conn, book["id"], leitor["id"], due_date=date(2026, 12, 31))
+    conn.commit()
+
+    due = conn.execute(
+        text("SELECT due_date FROM loans WHERE book_id = :b"), {"b": book["id"]}
+    ).scalars().first()
+    assert due == "2026-12-31"  # prazo ajustado vence o padrão
+
+
+# --- days_overdue / is_overdue --------------------------------------------
+
+@pytest.mark.parametrize(
+    "due,esperado",
+    [
+        ("2026-06-10", 5),   # venceu há 5 dias
+        ("2026-06-14", 1),   # venceu ontem
+        ("2026-06-15", 0),   # vence exatamente hoje -> ainda não é atraso
+        ("2026-06-16", 0),   # vence amanhã
+        ("2026-07-01", 0),   # bem no futuro
+        (None, 0),           # sem prazo
+        ("", 0),
+    ],
+)
+def test_days_overdue(due, esperado):
+    assert days_overdue(due, reference_date=HOJE) == esperado
+
+
+def test_is_overdue_vencido_e_ativo(conn):
+    assert is_overdue("2026-06-10", "ativo", HOJE) is True
+
+
+def test_is_overdue_vencendo_exatamente_hoje_nao_e_atraso():
+    assert is_overdue("2026-06-15", "ativo", HOJE) is False
+    assert days_overdue("2026-06-15", HOJE) == 0
+
+
+def test_is_overdue_prazo_futuro_nao_e_atraso():
+    assert is_overdue("2026-06-20", "ativo", HOJE) is False
+
+
+def test_is_overdue_due_date_nulo_nunca_e_atraso():
+    assert is_overdue(None, "ativo", HOJE) is False
+    assert is_overdue("", "ativo", HOJE) is False
+
+
+def test_is_overdue_devolvido_nao_e_atraso_mesmo_vencido():
+    assert is_overdue("2026-01-01", "devolvido", HOJE) is False
+
+
+# --- filtro de atrasados ---------------------------------------------------
+
+@pytest.fixture
+def emprestimos_variados(conn):
+    """4 empréstimos ativos: 2 atrasados, 1 no prazo, 1 sem prazo."""
+    create_user(conn, "Leitor A", "a@teste.org", "119", "senha123", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "a@teste.org")
+
+    # autores alfabéticos e distintos: nomes terminados em dígito gerariam
+    # todos o mesmo código (os dígitos não entram na regra) e colidiriam
+    cenarios = [
+        ("Atrasado 1", "Ana Silva", "2026-06-01"),    # 14 dias de atraso
+        ("Atrasado 2", "Bruno Costa", "2026-06-14"),  # 1 dia de atraso
+        ("No prazo", "Carla Dias", "2026-06-20"),
+        ("Sem prazo", "Diego Souza", None),
+    ]
+    for titulo, autor, due in cenarios:
+        code = add_book(conn, titulo, autor, "Literária")
+        conn.commit()
+        book = conn.execute(
+            text("SELECT * FROM books WHERE code = :c"), {"c": code}
+        ).mappings().first()
+        request_loan(conn, book["id"], leitor["id"])
+        conn.execute(
+            text("UPDATE loans SET due_date = :d WHERE book_id = :b"),
+            {"d": due, "b": book["id"]},
+        )
+        conn.commit()
+    return conn
+
+
+def test_list_active_loans_traz_todos_por_padrao(emprestimos_variados):
+    rows = list_active_loans(emprestimos_variados)
+    assert len(rows) == 4
+
+
+def test_filtro_somente_atrasados(emprestimos_variados):
+    rows = list_active_loans(
+        emprestimos_variados, only_overdue=True, reference_date=HOJE
+    )
+    titulos = sorted(r["title"] for r in rows)
+    assert titulos == ["Atrasado 1", "Atrasado 2"]
+
+
+def test_filtro_de_atrasados_exclui_sem_prazo_e_no_prazo(emprestimos_variados):
+    rows = list_active_loans(
+        emprestimos_variados, only_overdue=True, reference_date=HOJE
+    )
+    titulos = {r["title"] for r in rows}
+    assert "Sem prazo" not in titulos
+    assert "No prazo" not in titulos
+
+
+def test_filtro_de_atrasados_ignora_devolvidos(emprestimos_variados):
+    conn = emprestimos_variados
+    loan = conn.execute(
+        text(
+            "SELECT loans.id FROM loans JOIN books ON books.id = loans.book_id "
+            "WHERE books.title = 'Atrasado 1'"
+        )
+    ).scalars().first()
+    return_loan(conn, loan)
+    conn.commit()
+
+    rows = list_active_loans(conn, only_overdue=True, reference_date=HOJE)
+    assert [r["title"] for r in rows] == ["Atrasado 2"]
+
+
+def test_dias_de_atraso_reportados_corretamente(emprestimos_variados):
+    rows = list_active_loans(
+        emprestimos_variados, only_overdue=True, reference_date=HOJE
+    )
+    atrasos = {r["title"]: days_overdue(r["due_date"], HOJE) for r in rows}
+    assert atrasos == {"Atrasado 1": 14, "Atrasado 2": 1}
+
+
+# --- migração --------------------------------------------------------------
+
+def test_migracao_adiciona_due_date_preservando_emprestimos_existentes(tmp_path):
+    """Banco criado antes do recurso: ALTER TABLE adiciona a coluna sem
+    perder dados, e os empréstimos antigos ficam com due_date nulo."""
+    import sqlite3
+
+    db_path = tmp_path / "legado.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE books (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL, author TEXT NOT NULL, category TEXT,
+          status TEXT NOT NULL DEFAULT 'Disponível', created_at TEXT NOT NULL);
+        CREATE TABLE loans (id INTEGER PRIMARY KEY, book_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL, loan_date TEXT NOT NULL, return_date TEXT,
+          status TEXT NOT NULL DEFAULT 'ativo');
+        INSERT INTO users VALUES (1,'Admin','admin@x.org','','h','s','admin','2026-01-01');
+        INSERT INTO books VALUES (1,'ANT-001','Antigo','Autor','Literária','Emprestado','2026-01-01');
+        INSERT INTO loans VALUES (1,1,1,'2026-01-05T10:00:00',NULL,'ativo');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database_url = f"sqlite:///{db_path}"
+    engine = get_engine(database_url)
+    create_schema(engine)  # dispara a migração
+
+    with get_connection(database_url) as connection:
+        loan = connection.execute(
+            text("SELECT loan_date, due_date, status FROM loans")
+        ).mappings().all()
+        assert len(loan) == 1                      # dado preservado
+        assert loan[0]["due_date"] is None         # antigo fica sem prazo
+        assert is_overdue(loan[0]["due_date"], loan[0]["status"]) is False
+
+    create_schema(engine)  # idempotente

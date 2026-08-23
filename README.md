@@ -126,7 +126,9 @@ borda do `bookCode.test.ts`), a estratégia de código por acervo
 (`parse_csv_bytes`, `process_import_rows`), o mapeamento flexível de colunas
 (`detect_column_mapping`, `apply_column_mapping`, `normalize_status`), a busca
 com filtros e paginação no banco (`count_books`, `list_books`,
-`list_book_categories`), inicialização do schema e do admin padrão
+`list_book_categories`), o prazo de devolução e o controle de atraso
+(`default_due_date`, `days_overdue`, `is_overdue`, `list_active_loans`),
+inicialização do schema e do admin padrão
 (`init_db`), o fluxo de empréstimo/devolução e a
 remoção de livros (`delete_book`).
 
@@ -292,6 +294,30 @@ em `ó` — sem isso a busca funcionaria em produção e falharia nos testes.
 > textual (varredura sequencial). Para ~2.5k livros isso é irrelevante, mas se
 > o acervo crescer muito, o próximo passo é uma coluna gerada e indexada com o
 > texto já normalizado, ou `pg_trgm` + `unaccent` no Postgres.
+
+## Prazo de devolução e atrasos
+
+- O prazo padrão fica na constante **`PRAZO_PADRAO_DIAS`** (hoje `14`) no
+  `app.py` — mudou ali, mudou em todo o sistema.
+- Ao registrar um empréstimo, a data prevista é calculada como
+  *data do empréstimo + prazo padrão*, e pode ser **ajustada antes de
+  confirmar** no popover "Pegar emprestado".
+- **Empréstimos ativos** e **Histórico completo** mostram a data prevista,
+  destacam os vencidos em vermelho e informam **há quantos dias** estão
+  atrasados. Empréstimos ativos tem ainda o filtro **"Somente atrasados"**.
+- Vencer **exatamente hoje ainda não é atraso** — a contagem começa no dia
+  seguinte.
+- Empréstimos com **prazo nulo nunca contam como atrasados** (é o caso dos
+  registros anteriores a este recurso).
+
+### Migração da coluna `due_date`
+
+`loans.due_date` é adicionada automaticamente por `create_schema()` via
+`ALTER TABLE ... ADD COLUMN` quando o banco já existe — `metadata.create_all()`
+só cria tabelas que faltam, nunca colunas, então um banco já em uso (o Supabase
+do CCE) precisa desse passo explícito. **Nenhum dado é perdido**: os
+empréstimos existentes ficam com `due_date` nulo. A migração é idempotente e
+funciona igual em Postgres e SQLite.
 
 ## Painéis administrativos de empréstimos
 

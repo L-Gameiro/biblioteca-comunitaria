@@ -28,7 +28,7 @@ import os
 import re
 import unicodedata
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 
 import streamlit as st
@@ -42,6 +42,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     func,
+    inspect,
     or_,
     select,
     text,
@@ -151,6 +152,11 @@ loans_table = Table(
     Column("book_id", Integer, ForeignKey("books.id"), nullable=False),
     Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
     Column("loan_date", Text, nullable=False),
+    # Data prevista de devolução (ISO "YYYY-MM-DD"), anulável: empréstimos
+    # anteriores a este recurso ficam sem prazo e nunca contam como atrasados.
+    # Guardada como TEXT para acompanhar loan_date/return_date — datas ISO
+    # comparam corretamente em ordem lexicográfica no Postgres e no SQLite.
+    Column("due_date", Text),
     Column("return_date", Text),
     Column("status", Text, nullable=False, server_default="ativo"),
     CheckConstraint("status IN ('ativo','devolvido')", name="ck_loans_status"),
@@ -199,8 +205,27 @@ def verify_password(password: str, digest: str, salt: str) -> bool:
     return check == digest
 
 
+def _migrate_add_loans_due_date(engine: Engine) -> None:
+    """Adiciona loans.due_date em bancos criados antes deste recurso.
+
+    metadata.create_all() só cria tabelas que faltam — nunca colunas — então
+    um banco já em uso (o Supabase do CCE) precisa do ALTER TABLE explícito.
+    Os empréstimos existentes ficam com due_date NULL, e NULL nunca é tratado
+    como atraso. ADD COLUMN funciona igual em Postgres e SQLite.
+    """
+    inspector = inspect(engine)
+    if "loans" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("loans")}
+    if "due_date" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE loans ADD COLUMN due_date TEXT"))
+
+
 def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
+    _migrate_add_loans_due_date(engine)
 
 
 _initialized_engine_ids: set[int] = set()
@@ -827,19 +852,68 @@ def commit_import(conn, processed_rows: list[dict]) -> int:
 # Empréstimos
 # ---------------------------------------------------------------------------
 
-def request_loan(conn, book_id, user_id):
+# Prazo padrão de devolução. Ajuste aqui para mudar em todo o sistema.
+PRAZO_PADRAO_DIAS = 14
+
+
+def _to_date(value) -> date | None:
+    """Converte str ISO / date / datetime em date. Vazio ou None -> None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def default_due_date(loan_date=None) -> date:
+    """Data prevista de devolução: data do empréstimo + prazo padrão."""
+    base = _to_date(loan_date) or date.today()
+    return base + timedelta(days=PRAZO_PADRAO_DIAS)
+
+
+def days_overdue(due_date, reference_date=None) -> int:
+    """Dias de atraso em relação à data prevista (0 se em dia ou sem prazo).
+
+    Vencer exatamente hoje ainda não é atraso — só a partir do dia seguinte."""
+    due = _to_date(due_date)
+    if due is None:
+        return 0
+    reference = _to_date(reference_date) or date.today()
+    return max(0, (reference - due).days)
+
+
+def is_overdue(due_date, status: str = "ativo", reference_date=None) -> bool:
+    """Empréstimo atrasado: ainda ativo, com prazo definido e já vencido.
+    due_date nulo (empréstimos anteriores ao recurso) nunca conta como atraso."""
+    if status != "ativo":
+        return False
+    return days_overdue(due_date, reference_date) > 0
+
+
+def request_loan(conn, book_id, user_id, due_date=None):
+    """Registra um empréstimo. Sem due_date explícito, aplica o prazo padrão;
+    com due_date, respeita o prazo ajustado no momento do registro."""
     book = conn.execute(
         text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
     ).mappings().first()
     if book is None or book["status"] != "Disponível":
         raise ValueError("Livro indisponível para empréstimo.")
     now = datetime.now().isoformat(timespec="seconds")
+    due = _to_date(due_date) or default_due_date(now)
     conn.execute(
         text(
-            "INSERT INTO loans (book_id, user_id, loan_date, status) "
-            "VALUES (:book_id, :user_id, :loan_date, :status)"
+            "INSERT INTO loans (book_id, user_id, loan_date, due_date, status) "
+            "VALUES (:book_id, :user_id, :loan_date, :due_date, :status)"
         ),
-        {"book_id": book_id, "user_id": user_id, "loan_date": now, "status": "ativo"},
+        {
+            "book_id": book_id,
+            "user_id": user_id,
+            "loan_date": now,
+            "due_date": due.isoformat(),
+            "status": "ativo",
+        },
     )
     conn.execute(
         text("UPDATE books SET status = 'Emprestado' WHERE id = :id"), {"id": book_id}
@@ -996,13 +1070,23 @@ def show_catalog(conn, user):
                 st.write(f"{STATUS_EMOJI.get(r['status'], '')} {r['status']}")
             with action_col:
                 if user["role"] == "leitor" and r["status"] == "Disponível":
-                    if st.button(
-                        "Pegar emprestado", key=f"borrow_{r['id']}", width="stretch"
-                    ):
-                        request_loan(conn, r["id"], user["id"])
-                        conn.commit()
-                        st.success(f'Empréstimo de "{r["title"]}" registrado!')
-                        st.rerun()
+                    with st.popover("Pegar emprestado", width="stretch"):
+                        due = st.date_input(
+                            "Devolução prevista",
+                            value=default_due_date(),
+                            key=f"due_{r['id']}",
+                            help=f"Prazo padrão: {PRAZO_PADRAO_DIAS} dias. "
+                            "Ajuste antes de confirmar, se necessário.",
+                        )
+                        if st.button(
+                            "Confirmar empréstimo",
+                            key=f"borrow_{r['id']}",
+                            width="stretch",
+                        ):
+                            request_loan(conn, r["id"], user["id"], due_date=due)
+                            conn.commit()
+                            st.success(f'Empréstimo de "{r["title"]}" registrado!')
+                            st.rerun()
 
 
 def show_book_management(conn):
@@ -1113,32 +1197,73 @@ def show_book_management(conn):
                         st.error(f"Não foi possível remover o livro: {exc}")
 
 
-def show_loan_management(conn):
-    st.header("Empréstimos ativos")
+def list_active_loans(conn, only_overdue: bool = False, reference_date=None):
+    """Empréstimos ativos com dados de contato do leitor e prazo.
+
+    Com only_overdue=True devolve apenas os vencidos — due_date nulo fica de
+    fora, porque empréstimo sem prazo nunca é atraso."""
     rows = conn.execute(
         text(
             """
             SELECT loans.id AS loan_id, books.title, books.code,
-                   users.full_name, users.email, users.phone, loans.loan_date
+                   users.full_name, users.email, users.phone,
+                   loans.loan_date, loans.due_date, loans.status
             FROM loans
             JOIN books ON books.id = loans.book_id
             JOIN users ON users.id = loans.user_id
             WHERE loans.status = 'ativo'
-            ORDER BY loans.loan_date
+            ORDER BY loans.due_date IS NULL, loans.due_date, loans.loan_date
             """
         )
     ).mappings().all()
 
+    if only_overdue:
+        rows = [
+            r for r in rows if is_overdue(r["due_date"], r["status"], reference_date)
+        ]
+    return rows
+
+
+def _due_date_caption(due_date, status, reference_date=None) -> str:
+    """Texto do prazo, com destaque quando vencido."""
+    if not due_date:
+        return "Sem prazo definido"
+    late = days_overdue(due_date, reference_date) if status == "ativo" else 0
+    if late > 0:
+        return f"🔴 **ATRASADO há {late} dia(s)** — prevista para {due_date}"
+    return f"Devolução prevista: {due_date}"
+
+
+def show_loan_management(conn):
+    st.header("Empréstimos ativos")
+
+    only_overdue = st.checkbox("Somente atrasados", key="loans_only_overdue")
+    rows = list_active_loans(conn, only_overdue=only_overdue)
+
     if not rows:
-        st.info("Nenhum empréstimo ativo no momento.")
+        st.info(
+            "Nenhum empréstimo atrasado no momento."
+            if only_overdue
+            else "Nenhum empréstimo ativo no momento."
+        )
+        return
+
+    overdue_total = sum(1 for r in rows if is_overdue(r["due_date"], r["status"]))
+    if overdue_total and not only_overdue:
+        st.warning(f"⚠️ {overdue_total} empréstimo(s) em atraso.")
 
     for r in rows:
+        late = is_overdue(r["due_date"], r["status"])
         with st.container(border=True):
             info_col, action_col = st.columns([5, 2])
             with info_col:
-                st.markdown(f"**{r['title']}** ({r['code']})")
+                st.markdown(f"{'🔴 ' if late else ''}**{r['title']}** ({r['code']})")
                 st.caption(f"{r['full_name']} · {r['email']} · {r['phone'] or '-'}")
                 st.write(f"Emprestado em {r['loan_date']}")
+                if late:
+                    st.error(_due_date_caption(r["due_date"], r["status"]))
+                else:
+                    st.caption(_due_date_caption(r["due_date"], r["status"]))
             with action_col:
                 if st.button(
                     "✅ Registrar devolução", key=f"return_{r['loan_id']}", width="stretch"
@@ -1155,7 +1280,8 @@ def show_admin_loan_history(conn):
     rows = conn.execute(
         text(
             """
-            SELECT loans.id AS loan_id, loans.loan_date, loans.return_date, loans.status,
+            SELECT loans.id AS loan_id, loans.loan_date, loans.due_date,
+                   loans.return_date, loans.status,
                    books.id AS book_id, books.title AS book_title, books.code AS book_code,
                    users.id AS user_id, users.full_name, users.email, users.phone
             FROM loans
@@ -1205,8 +1331,19 @@ def show_admin_loan_history(conn):
             if start <= datetime.fromisoformat(r["loan_date"]).date() <= end
         ]
 
+    overdue_total = sum(1 for r in filtered if is_overdue(r["due_date"], r["status"]))
     st.write(f"{len(filtered)} empréstimo(s) encontrado(s).")
+    if overdue_total:
+        st.warning(f"⚠️ {overdue_total} deles em atraso.")
+
     status_emoji = {"ativo": "🔴", "devolvido": "🟢"}
+
+    def _situacao(r):
+        late = days_overdue(r["due_date"]) if r["status"] == "ativo" else 0
+        if late > 0:
+            return f"🔴 atrasado há {late} dia(s)"
+        return f"{status_emoji.get(r['status'], '')} {r['status']}"
+
     table = [
         {
             "Livro": f"{r['book_title']} ({r['book_code']})",
@@ -1214,8 +1351,9 @@ def show_admin_loan_history(conn):
             "E-mail": r["email"],
             "Telefone": r["phone"] or "-",
             "Emprestado em": r["loan_date"],
+            "Prevista": r["due_date"] or "-",
             "Devolvido em": r["return_date"] or "-",
-            "Status": f"{status_emoji.get(r['status'], '')} {r['status']}",
+            "Status": _situacao(r),
         }
         for r in filtered
     ]
@@ -1225,9 +1363,12 @@ def show_admin_loan_history(conn):
         user_loans = [r for r in rows if r["user_id"] == user_options[user_choice]]
         with st.expander(f"📋 Todos os empréstimos de {user_choice}", expanded=True):
             for r in user_loans:
+                late = days_overdue(r["due_date"]) if r["status"] == "ativo" else 0
+                marker = f" — 🔴 atrasado há {late} dia(s)" if late else ""
                 st.write(
                     f"- **{r['book_title']}** ({r['book_code']}) — "
-                    f"{r['loan_date']} → {r['return_date'] or 'em aberto'} [{r['status']}]"
+                    f"{r['loan_date']} → {r['return_date'] or 'em aberto'} "
+                    f"[prevista: {r['due_date'] or 'sem prazo'}] [{r['status']}]{marker}"
                 )
 
 
@@ -1238,7 +1379,8 @@ def show_my_loans(conn, user):
     active = conn.execute(
         text(
             """
-            SELECT loans.id AS loan_id, books.title, books.code, loans.loan_date
+            SELECT loans.id AS loan_id, books.title, books.code,
+                   loans.loan_date, loans.due_date, loans.status
             FROM loans JOIN books ON books.id = loans.book_id
             WHERE loans.user_id = :user_id AND loans.status = 'ativo'
             """
@@ -1249,11 +1391,16 @@ def show_my_loans(conn, user):
     if not active:
         st.info("Você não tem livros emprestados no momento.")
     for r in active:
+        late = is_overdue(r["due_date"], r["status"])
         with st.container(border=True):
             info_col, action_col = st.columns([5, 2])
             with info_col:
-                st.markdown(f"**{r['title']}** ({r['code']})")
+                st.markdown(f"{'🔴 ' if late else ''}**{r['title']}** ({r['code']})")
                 st.caption(f"Desde {r['loan_date']}")
+                if late:
+                    st.error(_due_date_caption(r["due_date"], r["status"]))
+                else:
+                    st.caption(_due_date_caption(r["due_date"], r["status"]))
             with action_col:
                 if st.button(
                     "Solicitar devolução", key=f"selfreturn_{r['loan_id']}", width="stretch"
