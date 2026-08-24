@@ -600,6 +600,73 @@ def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
         assert user_count == 1  # não duplicou o admin na 2ª chamada
 
 
+def test_init_db_recria_admin_quando_ha_leitores_mas_nenhum_admin(tmp_path):
+    """Estado inconsistente (anonimização, migração, SQL manual) pode deixar
+    o banco com leitores cadastrados e nenhum admin — sem recriação, o acesso
+    fica irrecuperável pela aplicação."""
+    database_url = f"sqlite:///{tmp_path}/sem_admin.db"
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        connection.execute(text("DELETE FROM users WHERE role = 'admin'"))
+        create_user(connection, "Leitora", "leitora@teste.org", "", "senha123", "leitor")
+        connection.commit()
+
+    app._ensure_initialized.clear()
+    init_db(database_url)  # simula o restart que deve recuperar o acesso
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        assert admin is not None
+        assert admin["role"] == "admin"
+
+        role_counts = connection.execute(
+            text("SELECT role, COUNT(*) AS n FROM users GROUP BY role")
+        ).mappings().all()
+        counts = {row["role"]: row["n"] for row in role_counts}
+        assert counts == {"admin": 1, "leitor": 1}
+
+
+def test_init_db_com_admin_existente_nao_recria_nem_duplica(tmp_path):
+    database_url = f"sqlite:///{tmp_path}/com_admin.db"
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        connection.execute(
+            text("UPDATE users SET must_change_password = 0 WHERE role = 'admin'")
+        )
+        create_user(connection, "Outro Admin", "outro.admin@teste.org", "", "senha123", "admin")
+        connection.commit()
+
+    app._ensure_initialized.clear()
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        admin_count = connection.execute(
+            text("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+        ).mappings().first()["n"]
+        assert admin_count == 2  # nenhum admin novo foi criado
+
+        default_admin = get_user_by_email(connection, "admin@biblioteca.org")
+        assert bool(default_admin["must_change_password"]) is False  # não foi recriado/sobrescrito
+
+
+def test_admin_recriado_apos_perda_nasce_exigindo_troca_de_senha(tmp_path):
+    database_url = f"sqlite:///{tmp_path}/recriado_forca_troca.db"
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        connection.execute(text("DELETE FROM users WHERE role = 'admin'"))
+        connection.commit()
+
+    app._ensure_initialized.clear()
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        assert bool(admin["must_change_password"]) is True
+
+
 def test_init_db_nao_insere_livros_de_exemplo(tmp_path):
     """O catálogo começa vazio: os livros vêm da carga real do acervo, e um
     seed automático colidiria com códigos reais do cliente (ASSM-001 etc.)."""

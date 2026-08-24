@@ -318,7 +318,15 @@ def _ensure_initialized(database_url: str) -> bool:
         # Só o admin padrão é criado automaticamente — necessário para o
         # primeiro acesso. O catálogo começa vazio: os livros vêm da carga
         # real do acervo (cadastro manual ou importação de CSV).
-        if conn.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"] == 0:
+        #
+        # A checagem é pela ausência de ADMIN, não de usuários: um banco com
+        # leitores cadastrados mas sem nenhum admin (anonimização, migração,
+        # SQL manual) precisa recriar o acesso, senão fica irrecuperável pela
+        # aplicação.
+        admin_count = conn.execute(
+            text("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+        ).mappings().first()["n"]
+        if admin_count == 0:
             create_user(
                 conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin",
                 must_change_password=True,
