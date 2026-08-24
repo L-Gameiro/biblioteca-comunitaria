@@ -2078,7 +2078,9 @@ def show_app(conn):
     elif page == "Importar CSV":
         show_csv_import(conn)
 
-
+# CSS mira DOM interno do Streamlit (não é API pública).
+# Verificado em 1.61.x via inspeção de DOM. Se a borda vinho voltar a
+# ficar cinza após um upgrade, reinspecionar os data-testid dos containers.
 def _inject_card_border_css() -> None:
     """Ajustes visuais para identidade do Centro Cultural Esplanada:
     1. Tinge a borda de todo st.container(border=True) em vinho suave, compatível
