@@ -2080,14 +2080,38 @@ def show_app(conn):
 
 
 def _inject_card_border_css() -> None:
-    """Tinge a borda de todo st.container(border=True) em vinho suave, no
-    lugar do cinza padrão do tema, sem competir com o vermelho sólido dos
-    botões primários."""
+    """Ajustes visuais para identidade do Centro Cultural Esplanada:
+    1. Tinge a borda de todo st.container(border=True) em vinho suave, compatível
+       com Streamlit moderno ([data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"])
+       e versões legadas ([data-testid="stVerticalBlockBorderWrapper"]).
+    2. Dimensiona a logo na barra lateral para que fique proporcional e legível.
+    3. Otimiza o espaçamento entre blocos em viewports mobile."""
     st.markdown(
         """
         <style>
-        [data-testid="stVerticalBlockBorderWrapper"] {
+        /* Borda de todo st.container(border=True) em vinho suave */
+        [data-testid="stVerticalBlockBorderWrapper"],
+        [data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"],
+        div[data-testid="stVerticalBlock"]:has(> div[data-testid="stLayoutWrapper"]) {
             border-color: rgba(122, 31, 43, 0.3) !important;
+        }
+
+        /* Logo na barra lateral proporcional, nítida e legível */
+        [data-testid="stSidebarLogo"],
+        [data-testid="stLogo"] img,
+        [data-testid="stSidebarHeader"] img {
+            height: auto !important;
+            max-height: 48px !important;
+            width: auto !important;
+            max-width: 180px !important;
+            object-fit: contain !important;
+        }
+
+        /* Ajustes de espaçamento em dispositivos móveis */
+        @media (max-width: 640px) {
+            [data-testid="stHorizontalBlock"] {
+                gap: 0.5rem !important;
+            }
         }
         </style>
         """,
