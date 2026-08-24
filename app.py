@@ -9,27 +9,28 @@ Como rodar:
     cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # preencha DATABASE_URL
     streamlit run app.py
 
-Login de administrador criado automaticamente na 1ª execução:
+Login de administrador criado automaticamente na 1ª execução (a troca de
+senha é obrigatória no primeiro login — não fica exposta na tela do app):
     e-mail:  admin@biblioteca.org
     senha:   admin123
 
 ⚠️ Este é um PROTÓTIPO para validar as regras de negócio (RBAC simples,
-geração de código do livro, fluxo de empréstimo/devolução). O hashing de
-senha aqui é básico (sha256 + salt) e não há proteção contra força bruta,
-CSRF, etc. — não usar como está em produção real; a versão de produção
-(Next.js) deve usar um provedor de auth de verdade (NextAuth/Supabase Auth).
+geração de código do livro, fluxo de empréstimo/devolução). Não há CSRF
+dedicado — a versão de produção (Next.js) deve usar um provedor de auth de
+verdade (NextAuth/Supabase Auth).
 """
 
 import csv
 import hashlib
+import hmac
 import io
 import itertools
-import os
 import re
 import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta
 
+import bcrypt
 import streamlit as st
 from sqlalchemy import (
     CheckConstraint,
@@ -123,11 +124,29 @@ users_table = Table(
     Column("full_name", Text, nullable=False),
     Column("email", Text, nullable=False, unique=True),
     Column("phone", Text),
+    # password_hash guarda bcrypt (salt embutido no próprio hash) para contas
+    # novas/já migradas; salt só é usado para o formato legado sha256+salt e
+    # fica '' assim que a senha é trocada ou re-hasheada — ver hash_password.
     Column("password_hash", Text, nullable=False),
     Column("salt", Text, nullable=False),
     Column("role", Text, nullable=False),
+    Column("must_change_password", Integer, nullable=False, server_default="0"),
     Column("created_at", Text, nullable=False),
     CheckConstraint("role IN ('admin','leitor')", name="ck_users_role"),
+    CheckConstraint("must_change_password IN (0,1)", name="ck_users_must_change_password"),
+)
+
+# Contador de tentativas de login malsucedidas por e-mail, para bloqueio
+# temporário por força bruta. Tabela própria (em vez de colunas em users)
+# porque precisa registrar tentativas mesmo contra e-mails que não existem,
+# sem vazar essa distinção para quem está tentando (mensagem de erro genérica
+# tanto para e-mail inexistente quanto para senha errada).
+login_attempts_table = Table(
+    "login_attempts",
+    metadata,
+    Column("email", Text, primary_key=True),
+    Column("failed_count", Integer, nullable=False, server_default="0"),
+    Column("locked_until", Text),
 )
 
 books_table = Table(
@@ -206,16 +225,31 @@ def get_connection(database_url: str | None = None) -> Connection:
     return conn
 
 
-def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
-    if salt is None:
-        salt = os.urandom(16).hex()
-    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-    return digest, salt
+BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+
+
+def _is_bcrypt_hash(digest: str) -> bool:
+    return isinstance(digest, str) and digest.startswith(BCRYPT_PREFIXES)
+
+
+def hash_password(password: str) -> str:
+    """Hash bcrypt (custo default da lib) — o salt vem embutido no hash."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _hash_password_legacy(password: str, salt: str) -> str:
+    """Formato antigo (sha256 + salt), mantido só para verificar contas que
+    ainda não logaram desde a migração para bcrypt — ver authenticate()."""
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
 def verify_password(password: str, digest: str, salt: str) -> bool:
-    check, _ = hash_password(password, salt)
-    return check == digest
+    if _is_bcrypt_hash(digest):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), digest.encode("utf-8"))
+        except ValueError:
+            return False
+    return hmac.compare_digest(_hash_password_legacy(password, salt or ""), digest)
 
 
 def _migrate_add_loans_due_date(engine: Engine) -> None:
@@ -236,9 +270,32 @@ def _migrate_add_loans_due_date(engine: Engine) -> None:
         conn.execute(text("ALTER TABLE loans ADD COLUMN due_date TEXT"))
 
 
+def _migrate_add_users_must_change_password(engine: Engine) -> None:
+    """Adiciona users.must_change_password em bancos criados antes deste
+    recurso (metadata.create_all só cria tabelas que faltam, nunca colunas).
+
+    Contas admin existentes só puderam nascer com a senha padrão que era
+    exibida na tela de login (admin123) — força a troca no próximo login
+    delas também, fechando essa exposição em bancos já em produção. Contas
+    leitor não são afetadas.
+    """
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("users")}
+    if "must_change_password" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        )
+        conn.execute(text("UPDATE users SET must_change_password = 1 WHERE role = 'admin'"))
+
+
 def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
     _migrate_add_loans_due_date(engine)
+    _migrate_add_users_must_change_password(engine)
 
 
 @st.cache_resource(show_spinner=False)
@@ -263,7 +320,8 @@ def _ensure_initialized(database_url: str) -> bool:
         # real do acervo (cadastro manual ou importação de CSV).
         if conn.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"] == 0:
             create_user(
-                conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin"
+                conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin",
+                must_change_password=True,
             )
             conn.commit()
     return True
@@ -277,25 +335,44 @@ def init_db(database_url: str | None = None) -> None:
 # Usuários
 # ---------------------------------------------------------------------------
 
-def create_user(conn, full_name, email, phone, password, role):
-    digest, salt = hash_password(password)
+def create_user(conn, full_name, email, phone, password, role, must_change_password=False):
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         text(
             """INSERT INTO users
-               (full_name, email, phone, password_hash, salt, role, created_at)
-               VALUES (:full_name, :email, :phone, :password_hash, :salt, :role, :created_at)"""
+               (full_name, email, phone, password_hash, salt, role, must_change_password, created_at)
+               VALUES (:full_name, :email, :phone, :password_hash, :salt, :role,
+                       :must_change_password, :created_at)"""
         ),
         {
             "full_name": full_name,
             "email": email.lower().strip(),
             "phone": phone,
-            "password_hash": digest,
-            "salt": salt,
+            "password_hash": hash_password(password),
+            "salt": "",
             "role": role,
+            "must_change_password": 1 if must_change_password else 0,
             "created_at": now,
         },
     )
+
+
+def try_create_reader(conn, full_name, email, phone, password) -> tuple[bool, str | None]:
+    """Cria conta de leitor. Retorna (sucesso, mensagem_de_erro).
+
+    A checagem de e-mail duplicado feita antes de chamar isto é só uma
+    otimização de UX (evita o INSERT na maioria dos casos): a garantia real
+    vem da constraint UNIQUE do banco, tratada aqui via IntegrityError para
+    não vazar stack trace ao visitante se dois cadastros com o mesmo e-mail
+    chegarem em paralelo (corrida entre a checagem e o INSERT).
+    """
+    try:
+        create_user(conn, full_name, email, phone, password, "leitor")
+        conn.commit()
+        return True, None
+    except IntegrityError:
+        conn.rollback()
+        return False, "Já existe um cadastro com esse e-mail."
 
 
 def get_user_by_email(conn, email):
@@ -307,9 +384,36 @@ def get_user_by_email(conn, email):
 
 def authenticate(conn, email, password):
     user = get_user_by_email(conn, email)
-    if user and verify_password(password, user["password_hash"], user["salt"]):
-        return user
-    return None
+    if not user or not verify_password(password, user["password_hash"], user["salt"]):
+        return None
+    if not _is_bcrypt_hash(user["password_hash"]):
+        # Login bem-sucedido com hash no formato legado: re-hasheia para
+        # bcrypt agora que temos a senha em texto puro em mãos. Migração
+        # transparente — o usuário não percebe, e o hash antigo nunca mais
+        # fica gravado no banco depois deste ponto.
+        new_hash = hash_password(password)
+        conn.execute(
+            text("UPDATE users SET password_hash = :h, salt = '' WHERE id = :id"),
+            {"h": new_hash, "id": user["id"]},
+        )
+        conn.commit()
+        user = dict(user)
+        user["password_hash"] = new_hash
+        user["salt"] = ""
+    return user
+
+
+def _session_user_view(user) -> dict:
+    """Só os campos necessários em st.session_state — nunca password_hash
+    nem salt, que não precisam viver na memória do processo por toda a
+    sessão."""
+    return {
+        "id": user["id"],
+        "full_name": user["full_name"],
+        "email": user["email"],
+        "role": user["role"],
+        "must_change_password": bool(user["must_change_password"]),
+    }
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -317,6 +421,108 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def is_valid_email(email: str) -> bool:
     return bool(EMAIL_RE.match((email or "").strip()))
+
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def password_strength_error(password: str) -> str | None:
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        return f"A senha precisa ter pelo menos {MIN_PASSWORD_LENGTH} caracteres."
+    return None
+
+
+def change_password(conn, user_id, current_password, new_password) -> bool:
+    """Troca a senha se a atual conferir; commita e retorna True nesse caso.
+    Se a senha atual não confere, não altera nada e retorna False."""
+    row = conn.execute(
+        text("SELECT password_hash, salt FROM users WHERE id = :id"),
+        {"id": user_id},
+    ).mappings().first()
+    if not row or not verify_password(current_password, row["password_hash"], row["salt"]):
+        return False
+    conn.execute(
+        text(
+            "UPDATE users SET password_hash = :h, salt = '', must_change_password = 0 "
+            "WHERE id = :id"
+        ),
+        {"h": hash_password(new_password), "id": user_id},
+    )
+    conn.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting de login (força bruta)
+# ---------------------------------------------------------------------------
+# Persistido no banco, não em memória do processo: o Streamlit Cloud
+# hiberna e reinicia o container, o que zeraria um contador em memória e
+# derrubaria a proteção justamente quando o app volta ao ar.
+
+MAX_LOGIN_ATTEMPTS = 5
+# A partir da MAX_LOGIN_ATTEMPTS-ésima falha, cada falha seguinte aumenta o
+# tempo de bloqueio (1, 5, 15, 30, 60 minutos; permanece em 60 depois disso).
+LOGIN_LOCKOUT_MINUTES_SCHEDULE = [1, 5, 15, 30, 60]
+
+
+def _lockout_minutes_for(failed_count: int) -> int:
+    step = max(failed_count - MAX_LOGIN_ATTEMPTS, 0)
+    index = min(step, len(LOGIN_LOCKOUT_MINUTES_SCHEDULE) - 1)
+    return LOGIN_LOCKOUT_MINUTES_SCHEDULE[index]
+
+
+def _login_locked_until(conn, email, now=None):
+    """Retorna o datetime até quando o e-mail está bloqueado, ou None se
+    não está bloqueado (nunca tentou, nunca excedeu o limite, ou o bloqueio
+    anterior já expirou)."""
+    now = now or datetime.now()
+    row = conn.execute(
+        text("SELECT locked_until FROM login_attempts WHERE email = :email"),
+        {"email": (email or "").lower().strip()},
+    ).mappings().first()
+    if not row or not row["locked_until"]:
+        return None
+    locked_until = datetime.fromisoformat(row["locked_until"])
+    return locked_until if now < locked_until else None
+
+
+def _register_failed_login(conn, email, now=None) -> None:
+    now = now or datetime.now()
+    email_norm = (email or "").lower().strip()
+    row = conn.execute(
+        text("SELECT failed_count FROM login_attempts WHERE email = :email"),
+        {"email": email_norm},
+    ).mappings().first()
+    failed_count = (row["failed_count"] if row else 0) + 1
+    locked_until = None
+    if failed_count >= MAX_LOGIN_ATTEMPTS:
+        minutes = _lockout_minutes_for(failed_count)
+        locked_until = (now + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    if row:
+        conn.execute(
+            text(
+                "UPDATE login_attempts SET failed_count = :fc, locked_until = :lu "
+                "WHERE email = :email"
+            ),
+            {"fc": failed_count, "lu": locked_until, "email": email_norm},
+        )
+    else:
+        conn.execute(
+            text(
+                "INSERT INTO login_attempts (email, failed_count, locked_until) "
+                "VALUES (:email, :fc, :lu)"
+            ),
+            {"email": email_norm, "fc": failed_count, "lu": locked_until},
+        )
+    conn.commit()
+
+
+def _clear_login_attempts(conn, email) -> None:
+    conn.execute(
+        text("DELETE FROM login_attempts WHERE email = :email"),
+        {"email": (email or "").lower().strip()},
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -999,13 +1205,21 @@ def show_auth_screen(conn):
             email = st.text_input("E-mail", key="login_email")
             password = st.text_input("Senha", type="password", key="login_password")
             if st.form_submit_button("Entrar"):
-                user = authenticate(conn, email, password)
-                if user:
-                    st.session_state.user = dict(user)
-                    st.rerun()
+                locked_until = _login_locked_until(conn, email)
+                if locked_until:
+                    st.error(
+                        "Muitas tentativas inválidas para este e-mail. Tente "
+                        f"novamente após {locked_until.strftime('%H:%M:%S')}."
+                    )
                 else:
-                    st.error("E-mail ou senha inválidos.")
-        st.caption("Admin padrão: admin@biblioteca.org / admin123")
+                    user = authenticate(conn, email, password)
+                    if user:
+                        _clear_login_attempts(conn, email)
+                        st.session_state.user = _session_user_view(user)
+                        st.rerun()
+                    else:
+                        _register_failed_login(conn, email)
+                        st.error("E-mail ou senha inválidos.")
 
     with tab_cadastro:
         with st.form("cadastro_form"):
@@ -1027,13 +1241,59 @@ def show_auth_screen(conn):
                 if not password_c:
                     st.error("Senha é obrigatória.")
                     has_error = True
+                else:
+                    strength_error = password_strength_error(password_c)
+                    if strength_error:
+                        st.error(strength_error)
+                        has_error = True
                 if not has_error and get_user_by_email(conn, email_c):
                     st.error("Já existe um cadastro com esse e-mail.")
                     has_error = True
                 if not has_error:
-                    create_user(conn, full_name, email_c, phone, password_c, "leitor")
-                    conn.commit()
-                    st.success("Cadastro realizado! Faça login na aba ao lado.")
+                    success, error_message = try_create_reader(
+                        conn, full_name, email_c, phone, password_c
+                    )
+                    if success:
+                        st.success("Cadastro realizado! Faça login na aba ao lado.")
+                    else:
+                        st.error(error_message)
+
+
+def show_change_password_screen(conn, user, forced: bool = False):
+    st.title("Alterar minha senha")
+    if forced:
+        st.warning(
+            "Por segurança, defina uma nova senha antes de continuar usando o sistema."
+        )
+    with st.form("change_password_form"):
+        current = st.text_input("Senha atual", type="password", key="cp_current")
+        new = st.text_input("Nova senha", type="password", key="cp_new")
+        confirm = st.text_input("Confirmar nova senha", type="password", key="cp_confirm")
+        if st.form_submit_button("Salvar nova senha"):
+            has_error = False
+            if not current:
+                st.error("Informe a senha atual.")
+                has_error = True
+            strength_error = password_strength_error(new)
+            if strength_error:
+                st.error(strength_error)
+                has_error = True
+            if not has_error and new != confirm:
+                st.error("A confirmação não corresponde à nova senha.")
+                has_error = True
+            if not has_error and current == new:
+                st.error("A nova senha deve ser diferente da atual.")
+                has_error = True
+            if not has_error:
+                if change_password(conn, user["id"], current, new):
+                    st.session_state.user["must_change_password"] = False
+                    st.success("Senha alterada com sucesso.")
+                    st.rerun()
+                else:
+                    st.error("Senha atual incorreta.")
+    if forced and st.button("Sair"):
+        st.session_state.user = None
+        st.rerun()
 
 
 BOOK_STATUSES = ["Disponível", "Emprestado", "Em Manutenção"]
@@ -2053,10 +2313,11 @@ def show_app(conn):
                     "Reconciliação",
                     "Histórico completo",
                     "Importar CSV",
+                    "Alterar minha senha",
                 ],
             )
         else:
-            page = st.radio("Menu", ["Catálogo", "Meus Empréstimos"])
+            page = st.radio("Menu", ["Catálogo", "Meus Empréstimos", "Alterar minha senha"])
         if st.button("Sair"):
             st.session_state.user = None
             st.rerun()
@@ -2077,6 +2338,8 @@ def show_app(conn):
         show_my_loans(conn, user)
     elif page == "Importar CSV":
         show_csv_import(conn)
+    elif page == "Alterar minha senha":
+        show_change_password_screen(conn, user)
 
 # CSS mira DOM interno do Streamlit (não é API pública).
 # Verificado em 1.61.x via inspeção de DOM. Se a borda vinho voltar a
@@ -2141,6 +2404,8 @@ def main():
     with get_connection() as conn:
         if st.session_state.user is None:
             show_auth_screen(conn)
+        elif st.session_state.user.get("must_change_password"):
+            show_change_password_screen(conn, st.session_state.user, forced=True)
         else:
             show_app(conn)
 

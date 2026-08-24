@@ -15,7 +15,7 @@ usada em produção (Postgres/Supabase) — não dependem de acesso de rede.
 
 import csv
 import io
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -26,10 +26,16 @@ from app import (
     CATEGORY_FILTER_ALL,
     CODE_STRATEGY_AUTHOR,
     CODE_STRATEGY_NUMERIC,
+    MAX_LOGIN_ATTEMPTS,
     STATUS_FILTER_ALL,
+    _clear_login_attempts,
     _detect_csv_delimiter,
+    _hash_password_legacy,
+    _login_locked_until,
+    _register_failed_login,
     add_book,
     apply_column_mapping,
+    change_password,
     count_books,
     count_loans_for_book,
     count_unreconciled_books,
@@ -49,6 +55,7 @@ from app import (
     get_engine,
     get_user_by_email,
     get_active_loan_for_book,
+    hash_password,
     init_db,
     is_overdue,
     is_valid_email,
@@ -61,11 +68,13 @@ from app import (
     max_numeric_code_for_category,
     normalize_status,
     parse_csv_bytes,
+    password_strength_error,
     process_import_rows,
     reconcile_mark_returned,
     reconcile_register_loan,
     request_loan,
     return_loan,
+    try_create_reader,
     verify_password,
 )
 
@@ -331,6 +340,22 @@ def _espiritual_csv_bytes() -> bytes:
     return text.encode("utf-8-sig")
 
 
+def _login_as_admin_and_complete_forced_password_change(at, new_password="NovaSenh@123"):
+    """Login com a senha padrão do bootstrap (must_change_password=True) e
+    conclui a troca obrigatória, deixando o AppTest pronto para navegar nas
+    telas normais do admin."""
+    at.text_input(key="login_email").input("admin@biblioteca.org")
+    at.text_input(key="login_password").input("admin123")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+
+    at.text_input(key="cp_current").input("admin123")
+    at.text_input(key="cp_new").input(new_password)
+    at.text_input(key="cp_confirm").input(new_password)
+    at.button(key="FormSubmitter:change_password_form-Salvar nova senha").click().run()
+    assert not at.exception, at.exception
+
+
 def test_integracao_bytes_ate_get_csv_columns_espiritual_csv():
     """Integração da camada de parsing: bytes -> parse_csv_bytes ->
     get_csv_columns, com o perfil exato do arquivo que disparou o bug."""
@@ -364,10 +389,7 @@ def test_integracao_tela_importacao_mostra_12_colunas(tmp_path, monkeypatch):
 
     at = AppTest.from_file("app.py")
     at.run()
-    at.text_input(key="login_email").input("admin@biblioteca.org")
-    at.text_input(key="login_password").input("admin123")
-    at.button(key="FormSubmitter:login_form-Entrar").click().run()
-    assert not at.exception, at.exception
+    _login_as_admin_and_complete_forced_password_change(at)
 
     at.radio[0].set_value("Importar CSV").run()
     assert not at.exception, at.exception
@@ -424,9 +446,7 @@ def test_reenviar_arquivo_com_mesmo_nome_e_conteudo_diferente_reprocessa(tmp_pat
 
     at = AppTest.from_file("app.py")
     at.run()
-    at.text_input(key="login_email").input("admin@biblioteca.org")
-    at.text_input(key="login_password").input("admin123")
-    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    _login_as_admin_and_complete_forced_password_change(at)
     at.radio[0].set_value("Importar CSV").run()
     assert not at.exception, at.exception
 
@@ -573,6 +593,8 @@ def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
         assert admin is not None
         assert admin["role"] == "admin"
         assert verify_password("admin123", admin["password_hash"], admin["salt"])
+        assert admin["password_hash"].startswith("$2")  # bcrypt, não sha256
+        assert bool(admin["must_change_password"]) is True  # força troca no 1º login
 
         user_count = connection.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"]
         assert user_count == 1  # não duplicou o admin na 2ª chamada
@@ -617,6 +639,216 @@ def test_get_connection_sem_database_url_levanta_erro_claro(monkeypatch):
     monkeypatch.setattr(app.st, "secrets", {})
     with pytest.raises(RuntimeError, match="DATABASE_URL"):
         app.get_engine()
+
+
+# ---------------------------------------------------------------------------
+# Autenticação: troca obrigatória de senha, hashing, rate limiting, cadastro
+# ---------------------------------------------------------------------------
+
+def test_login_admin_bootstrap_fica_bloqueado_ate_trocar_a_senha(tmp_path, monkeypatch):
+    """Ponta a ponta pela tela real: logar com a senha padrão do bootstrap
+    não dá acesso a nenhuma tela do sistema — só à tela de troca de senha —
+    até que a troca seja concluída."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/forca_troca.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    at.text_input(key="login_email").input("admin@biblioteca.org")
+    at.text_input(key="login_password").input("admin123")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+
+    # Nada de menu/sidebar com as telas normais: só a tela de troca de senha.
+    assert at.title[0].value == "Alterar minha senha"
+    assert not at.radio  # sidebar com "Painel"/"Catálogo"/etc. não aparece
+
+    at.text_input(key="cp_current").input("admin123")
+    at.text_input(key="cp_new").input("NovaSenh@123")
+    at.text_input(key="cp_confirm").input("NovaSenh@123")
+    at.button(key="FormSubmitter:change_password_form-Salvar nova senha").click().run()
+    assert not at.exception, at.exception
+
+    assert at.header[0].value == "Painel"  # já dentro do app, tela padrão do admin
+    assert at.radio  # menu normal liberado
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        assert bool(admin["must_change_password"]) is False
+        assert verify_password("NovaSenh@123", admin["password_hash"], admin["salt"])
+        assert not verify_password("admin123", admin["password_hash"], admin["salt"])
+
+
+def test_migracao_forca_troca_de_senha_para_admin_ja_existente_em_producao(tmp_path):
+    """Banco criado antes deste recurso: a migração precisa marcar
+    must_change_password=1 para contas admin já existentes, porque a única
+    senha que elas puderam ter é a padrão exposta na tela antiga (admin123).
+    Contas leitor não são afetadas."""
+    import sqlite3
+
+    db_path = tmp_path / "legado_admin.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE books (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL, author TEXT NOT NULL, category TEXT,
+          status TEXT NOT NULL DEFAULT 'Disponível', created_at TEXT NOT NULL);
+        CREATE TABLE loans (id INTEGER PRIMARY KEY, book_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL, loan_date TEXT NOT NULL, due_date TEXT,
+          return_date TEXT, status TEXT NOT NULL DEFAULT 'ativo');
+        INSERT INTO users VALUES
+          (1,'Admin','admin@x.org','','h','s','admin','2026-01-01'),
+          (2,'Leitora','leitora@x.org','','h','s','leitor','2026-01-01');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database_url = f"sqlite:///{db_path}"
+    engine = get_engine(database_url)
+    create_schema(engine)  # dispara a migração
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@x.org")
+        leitora = get_user_by_email(connection, "leitora@x.org")
+        assert bool(admin["must_change_password"]) is True
+        assert bool(leitora["must_change_password"]) is False
+
+
+def test_change_password_exige_senha_atual_correta(conn):
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senhaAntiga1", "leitor")
+    conn.commit()
+    user = get_user_by_email(conn, "leitor@teste.org")
+
+    assert change_password(conn, user["id"], "senhaErrada", "senhaNova12") is False
+    ainda = get_user_by_email(conn, "leitor@teste.org")
+    assert verify_password("senhaAntiga1", ainda["password_hash"], ainda["salt"])
+
+    assert change_password(conn, user["id"], "senhaAntiga1", "senhaNova12") is True
+    trocado = get_user_by_email(conn, "leitor@teste.org")
+    assert verify_password("senhaNova12", trocado["password_hash"], trocado["salt"])
+    assert not verify_password("senhaAntiga1", trocado["password_hash"], trocado["salt"])
+    assert bool(trocado["must_change_password"]) is False
+
+
+def test_login_com_hash_legado_sha256_migra_para_bcrypt_automaticamente(conn):
+    """Simula uma conta criada antes da migração para bcrypt (hash sha256 +
+    salt gravado direto no banco). O primeiro login bem-sucedido deve
+    re-hashear a senha para bcrypt de forma transparente."""
+    salt = "abc123"
+    legacy_hash = _hash_password_legacy("senhaLegada1", salt)
+    conn.execute(
+        text(
+            """INSERT INTO users
+               (full_name, email, phone, password_hash, salt, role,
+                must_change_password, created_at)
+               VALUES ('Legado', 'legado@teste.org', '', :hash, :salt, 'leitor',
+                       0, '2026-01-01')"""
+        ),
+        {"hash": legacy_hash, "salt": salt},
+    )
+    conn.commit()
+
+    antes = get_user_by_email(conn, "legado@teste.org")
+    assert not antes["password_hash"].startswith("$2")
+
+    user = app.authenticate(conn, "legado@teste.org", "senhaLegada1")
+    assert user is not None
+    assert user["password_hash"].startswith("$2")  # já veio re-hasheado
+
+    depois = get_user_by_email(conn, "legado@teste.org")
+    assert depois["password_hash"].startswith("$2")
+    assert verify_password("senhaLegada1", depois["password_hash"], depois["salt"])
+
+    # login seguinte continua funcionando, já 100% no formato novo
+    assert app.authenticate(conn, "legado@teste.org", "senhaLegada1") is not None
+
+
+def test_rate_limit_bloqueia_apos_maximo_de_tentativas_e_libera_depois(conn):
+    email = "alvo@teste.org"
+    now = datetime(2026, 1, 1, 12, 0, 0)
+
+    for i in range(MAX_LOGIN_ATTEMPTS - 1):
+        _register_failed_login(conn, email, now=now)
+        assert _login_locked_until(conn, email, now=now) is None  # ainda não bateu o teto
+
+    _register_failed_login(conn, email, now=now)  # MAX_LOGIN_ATTEMPTS-ésima falha
+    locked_until = _login_locked_until(conn, email, now=now)
+    assert locked_until is not None
+    assert locked_until > now
+
+    # ainda bloqueado um instante antes do prazo
+    assert _login_locked_until(conn, email, now=locked_until - timedelta(seconds=1)) is not None
+    # liberado assim que o prazo passa
+    assert _login_locked_until(conn, email, now=locked_until + timedelta(seconds=1)) is None
+
+
+def test_rate_limit_cada_bloqueio_subsequente_e_maior_que_o_anterior(conn):
+    email = "reincidente@teste.org"
+    now = datetime(2026, 1, 1, 12, 0, 0)
+
+    for _ in range(MAX_LOGIN_ATTEMPTS):
+        _register_failed_login(conn, email, now=now)
+    primeiro_bloqueio = _login_locked_until(conn, email, now=now)
+
+    _register_failed_login(conn, email, now=primeiro_bloqueio)
+    segundo_bloqueio = _login_locked_until(conn, email, now=primeiro_bloqueio)
+
+    assert segundo_bloqueio > primeiro_bloqueio
+    assert (segundo_bloqueio - primeiro_bloqueio) > (primeiro_bloqueio - now)
+
+
+def test_login_bem_sucedido_limpa_o_contador_de_tentativas(conn):
+    create_user(conn, "Leitor", "sortudo@teste.org", "", "senhaCerta1", "leitor")
+    conn.commit()
+    now = datetime(2026, 1, 1, 12, 0, 0)
+
+    _register_failed_login(conn, "sortudo@teste.org", now=now)
+    _register_failed_login(conn, "sortudo@teste.org", now=now)
+    _clear_login_attempts(conn, "sortudo@teste.org")
+
+    row = conn.execute(
+        text("SELECT * FROM login_attempts WHERE email = :e"), {"e": "sortudo@teste.org"}
+    ).mappings().first()
+    assert row is None
+
+
+@pytest.mark.parametrize("senha", ["", "a", "1234567", "curtass"])
+def test_password_strength_error_rejeita_senha_curta(senha):
+    assert password_strength_error(senha) is not None
+
+
+@pytest.mark.parametrize("senha", ["12345678", "senhaRazoavel123"])
+def test_password_strength_error_aceita_senha_com_tamanho_minimo(senha):
+    assert password_strength_error(senha) is None
+
+
+def test_try_create_reader_cadastro_concorrente_mesmo_email_nao_vaza_excecao(conn):
+    """Reproduz a corrida entre a checagem de e-mail duplicado e o INSERT:
+    dois cadastros para o mesmo e-mail chegando em paralelo. O segundo deve
+    falhar com uma mensagem amigável, nunca com uma IntegrityError crua
+    subindo até a tela."""
+    sucesso1, erro1 = try_create_reader(
+        conn, "Primeiro", "duplicado@teste.org", "", "senhaValida1"
+    )
+    assert sucesso1 is True
+    assert erro1 is None
+
+    sucesso2, erro2 = try_create_reader(
+        conn, "Segundo", "duplicado@teste.org", "", "outraSenha1"
+    )
+    assert sucesso2 is False
+    assert erro2 == "Já existe um cadastro com esse e-mail."
+
+    count = conn.execute(
+        text("SELECT COUNT(*) AS n FROM users WHERE email = 'duplicado@teste.org'")
+    ).mappings().first()["n"]
+    assert count == 1  # só o primeiro cadastro foi persistido
 
 
 def test_fluxo_completo_de_emprestimo_e_devolucao(conn):
