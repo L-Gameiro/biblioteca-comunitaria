@@ -9,10 +9,15 @@ Como rodar:
     cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # preencha DATABASE_URL
     streamlit run app.py
 
-Login de administrador criado automaticamente na 1ª execução (a troca de
-senha é obrigatória no primeiro login — não fica exposta na tela do app):
-    e-mail:  admin@biblioteca.org
-    senha:   admin123
+Um administrador padrão é criado automaticamente na 1ª execução (e sempre
+que o banco fica sem nenhum admin), já obrigado a trocar a senha no primeiro
+login. As credenciais iniciais estão em _ensure_initialized, único lugar do
+projeto onde elas aparecem — não são repetidas aqui nem no README, que é
+público.
+
+Recuperação de senha é presencial: um admin redefine a senha pela tela
+"Gestão de Usuários" e entrega a senha temporária ao usuário. Não há fluxo
+por e-mail — ver README, seção "Por que não há recuperação por e-mail".
 
 ⚠️ Este é um PROTÓTIPO para validar as regras de negócio (RBAC simples,
 geração de código do livro, fluxo de empréstimo/devolução). Não há CSRF
@@ -26,6 +31,7 @@ import hmac
 import io
 import itertools
 import re
+import secrets
 import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -131,9 +137,30 @@ users_table = Table(
     Column("salt", Text, nullable=False),
     Column("role", Text, nullable=False),
     Column("must_change_password", Integer, nullable=False, server_default="0"),
+    # Incrementado sempre que um admin redefine a senha da conta. A view da
+    # sessão carrega o valor visto no login e ele é reconferido a cada rerun
+    # (ver _session_is_current): a sessão que ficou aberta em outra aba com a
+    # senha antiga cai no próximo clique, em vez de continuar valendo.
+    Column("session_version", Integer, nullable=False, server_default="0"),
     Column("created_at", Text, nullable=False),
     CheckConstraint("role IN ('admin','leitor')", name="ck_users_role"),
     CheckConstraint("must_change_password IN (0,1)", name="ck_users_must_change_password"),
+)
+
+# Trilha de auditoria das ações administrativas sobre contas (hoje só o
+# reset de senha; mudança de papel entra aqui quando existir). Guarda os
+# e-mails além dos ids porque o log precisa continuar legível depois que a
+# conta envolvida for removida — por isso também não há FK nem CASCADE.
+admin_audit_table = Table(
+    "admin_audit_log",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("action", Text, nullable=False),
+    Column("actor_user_id", Integer),
+    Column("actor_email", Text, nullable=False),
+    Column("target_user_id", Integer),
+    Column("target_email", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
 )
 
 # Contador de tentativas de login malsucedidas por e-mail, para bloqueio
@@ -274,10 +301,10 @@ def _migrate_add_users_must_change_password(engine: Engine) -> None:
     """Adiciona users.must_change_password em bancos criados antes deste
     recurso (metadata.create_all só cria tabelas que faltam, nunca colunas).
 
-    Contas admin existentes só puderam nascer com a senha padrão que era
-    exibida na tela de login (admin123) — força a troca no próximo login
-    delas também, fechando essa exposição em bancos já em produção. Contas
-    leitor não são afetadas.
+    Contas admin existentes só puderam nascer com a senha padrão do
+    bootstrap, que antes ficava exibida na própria tela de login — força a
+    troca no próximo login delas também, fechando essa exposição em bancos
+    já em produção. Contas leitor não são afetadas.
     """
     inspector = inspect(engine)
     if "users" not in inspector.get_table_names():
@@ -292,10 +319,30 @@ def _migrate_add_users_must_change_password(engine: Engine) -> None:
         conn.execute(text("UPDATE users SET must_change_password = 1 WHERE role = 'admin'"))
 
 
+def _migrate_add_users_session_version(engine: Engine) -> None:
+    """Adiciona users.session_version em bancos criados antes deste recurso.
+
+    Todas as contas começam na versão 0 — igual ao que uma sessão aberta
+    antes da migração carregaria — então ninguém é deslogado pela migração
+    em si. A invalidação só acontece a partir do primeiro reset de senha.
+    """
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("users")}
+    if "session_version" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
+        )
+
+
 def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
     _migrate_add_loans_due_date(engine)
     _migrate_add_users_must_change_password(engine)
+    _migrate_add_users_session_version(engine)
 
 
 @st.cache_resource(show_spinner=False)
@@ -323,6 +370,12 @@ def _ensure_initialized(database_url: str) -> bool:
         # leitores cadastrados mas sem nenhum admin (anonimização, migração,
         # SQL manual) precisa recriar o acesso, senão fica irrecuperável pela
         # aplicação.
+        #
+        # As credenciais iniciais abaixo são a ÚNICA cópia delas no projeto: o
+        # README (público) manda consultar este ponto do código em vez de
+        # repeti-las. A conta nasce com must_change_password, mas isso só é
+        # cobrado no primeiro login — quem faz o deploy deve logar e trocar a
+        # senha como parte do procedimento, não depois.
         admin_count = conn.execute(
             text("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
         ).mappings().first()["n"]
@@ -337,6 +390,11 @@ def _ensure_initialized(database_url: str) -> bool:
 
 def init_db(database_url: str | None = None) -> None:
     _ensure_initialized(database_url or _get_database_url_from_secrets())
+
+
+# Tamanho de página de todas as listagens paginadas da UI (livros, usuários,
+# reconciliação) — o mesmo número que _paginate usa para calcular o offset.
+PAGE_SIZE = 25
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +423,10 @@ def create_user(conn, full_name, email, phone, password, role, must_change_passw
     )
 
 
-def try_create_reader(conn, full_name, email, phone, password) -> tuple[bool, str | None]:
-    """Cria conta de leitor. Retorna (sucesso, mensagem_de_erro).
+def try_create_account(
+    conn, full_name, email, phone, password, role, must_change_password=False
+) -> tuple[bool, str | None]:
+    """Cria uma conta. Retorna (sucesso, mensagem_de_erro).
 
     A checagem de e-mail duplicado feita antes de chamar isto é só uma
     otimização de UX (evita o INSERT na maioria dos casos): a garantia real
@@ -375,12 +435,20 @@ def try_create_reader(conn, full_name, email, phone, password) -> tuple[bool, st
     chegarem em paralelo (corrida entre a checagem e o INSERT).
     """
     try:
-        create_user(conn, full_name, email, phone, password, "leitor")
+        create_user(
+            conn, full_name, email, phone, password, role,
+            must_change_password=must_change_password,
+        )
         conn.commit()
         return True, None
     except IntegrityError:
         conn.rollback()
         return False, "Já existe um cadastro com esse e-mail."
+
+
+def try_create_reader(conn, full_name, email, phone, password) -> tuple[bool, str | None]:
+    """Auto-cadastro pela tela de login — sempre nasce como leitor."""
+    return try_create_account(conn, full_name, email, phone, password, "leitor")
 
 
 def get_user_by_email(conn, email):
@@ -421,6 +489,9 @@ def _session_user_view(user) -> dict:
         "email": user["email"],
         "role": user["role"],
         "must_change_password": bool(user["must_change_password"]),
+        # Versão da sessão vista no login; reconferida contra o banco a cada
+        # rerun para derrubar a sessão se um admin redefinir esta senha.
+        "session_version": user["session_version"],
     }
 
 
@@ -458,6 +529,190 @@ def change_password(conn, user_id, current_password, new_password) -> bool:
     )
     conn.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Reset de senha pelo administrador (presencial, sem envio de e-mail)
+# ---------------------------------------------------------------------------
+# Não existe fluxo de "esqueci minha senha" por e-mail — ver README. A
+# recuperação é presencial: um admin gera uma senha temporária, entrega ao
+# usuário e a conta fica obrigada a trocá-la no próximo login.
+
+# Alfabeto sem caracteres ambíguos (0/O, 1/l/I) — a senha é lida na tela e
+# ditada/anotada à mão, então confundir um caractere custa um novo reset.
+TEMP_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+TEMP_PASSWORD_LENGTH = 12
+
+AUDIT_ACTION_PASSWORD_RESET = "password_reset"
+
+
+def generate_temporary_password(length: int = TEMP_PASSWORD_LENGTH) -> str:
+    """Senha temporária aleatória, sempre acima do mínimo de força exigido.
+
+    Usa secrets.choice (CSPRNG), não random: é credencial de acesso, ainda
+    que de vida curta.
+    """
+    length = max(length, MIN_PASSWORD_LENGTH)
+    return "".join(secrets.choice(TEMP_PASSWORD_ALPHABET) for _ in range(length))
+
+
+def log_admin_action(conn, action, actor, target) -> None:
+    """Registra uma ação administrativa sobre uma conta. Não commita — quem
+    chama decide a transação, para a ação e o log caírem juntos."""
+    conn.execute(
+        text(
+            """INSERT INTO admin_audit_log
+               (action, actor_user_id, actor_email, target_user_id, target_email, created_at)
+               VALUES (:action, :actor_user_id, :actor_email, :target_user_id,
+                       :target_email, :created_at)"""
+        ),
+        {
+            "action": action,
+            "actor_user_id": actor["id"],
+            "actor_email": actor["email"],
+            "target_user_id": target["id"],
+            "target_email": target["email"],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+def admin_reset_password(conn, actor, target_user_id, new_password=None) -> str:
+    """Redefine a senha de uma conta e devolve a senha temporária em texto
+    puro — a única vez em que ela existe fora do hash, para ser exibida ao
+    admin e repassada presencialmente.
+
+    Em uma única transação:
+      * grava o novo hash bcrypt (salt legado zerado, como em change_password);
+      * marca must_change_password, forçando a troca no próximo login;
+      * incrementa session_version, derrubando qualquer sessão que o usuário
+        tenha aberta com a senha antiga (ver _session_is_current);
+      * zera o rate limit do e-mail, senão um usuário que travou a conta
+        errando a senha continuaria bloqueado mesmo com a senha nova em mãos;
+      * registra na auditoria quem redefiniu a senha de quem e quando.
+
+    Levanta ValueError se o usuário não existir, ou se a senha informada pelo
+    admin não passar na regra de força.
+    """
+    target = conn.execute(
+        text("SELECT id, email FROM users WHERE id = :id"), {"id": target_user_id}
+    ).mappings().first()
+    if not target:
+        raise ValueError("Usuário não encontrado.")
+
+    if new_password:
+        strength_error = password_strength_error(new_password)
+        if strength_error:
+            raise ValueError(strength_error)
+        password = new_password
+    else:
+        password = generate_temporary_password()
+
+    conn.execute(
+        text(
+            """UPDATE users
+               SET password_hash = :h, salt = '', must_change_password = 1,
+                   session_version = session_version + 1
+               WHERE id = :id"""
+        ),
+        {"h": hash_password(password), "id": target_user_id},
+    )
+    _clear_login_attempts(conn, target["email"])
+    log_admin_action(conn, AUDIT_ACTION_PASSWORD_RESET, actor, target)
+    conn.commit()
+    return password
+
+
+def _session_is_current(conn, session_user) -> bool:
+    """A sessão ainda vale? Falso se a conta sumiu ou se a senha foi
+    redefinida por um admin depois deste login (session_version avançou).
+
+    Uma consulta por chave primária a cada rerun — o mesmo custo de qualquer
+    clique na tela, e o preço de a senha antiga parar de valer de verdade em
+    todas as abas, não só na que fez o reset.
+    """
+    row = conn.execute(
+        text("SELECT role, session_version FROM users WHERE id = :id"),
+        {"id": session_user["id"]},
+    ).mappings().first()
+    if not row:
+        return False
+    if row["session_version"] != session_user.get("session_version", 0):
+        return False
+    # papel rebaixado em outra aba não pode continuar valendo como admin
+    return row["role"] == session_user["role"]
+
+
+def count_admins(conn) -> int:
+    return conn.execute(
+        select(func.count()).select_from(users_table).where(users_table.c.role == "admin")
+    ).scalar_one()
+
+
+def _users_where_clauses(query: str = "", role: str | None = None):
+    """Busca por nome, e-mail ou telefone — a mesma busca sem acento do
+    acervo (ver _sql_unaccent), para "Jose" achar "José"."""
+    clauses = []
+
+    term = normalize_search_term(query)
+    if term:
+        pattern = f"%{term}%"
+        searchable = (
+            users_table.c.full_name,
+            users_table.c.email,
+            func.coalesce(users_table.c.phone, ""),
+        )
+        clauses.append(or_(*[_sql_unaccent(col).ilike(pattern) for col in searchable]))
+
+    if role:
+        clauses.append(users_table.c.role == role)
+
+    return clauses
+
+
+def count_users(conn, query: str = "", role: str | None = None) -> int:
+    stmt = select(func.count()).select_from(users_table)
+    for clause in _users_where_clauses(query, role):
+        stmt = stmt.where(clause)
+    return conn.execute(stmt).scalar_one()
+
+
+def list_users(
+    conn, query: str = "", role: str | None = None,
+    limit: int = PAGE_SIZE, offset: int = 0,
+):
+    """Uma página de usuários — admins primeiro, depois por nome. Nunca
+    seleciona password_hash/salt: a tela não tem o que fazer com eles."""
+    stmt = select(
+        users_table.c.id,
+        users_table.c.full_name,
+        users_table.c.email,
+        users_table.c.phone,
+        users_table.c.role,
+        users_table.c.must_change_password,
+        users_table.c.created_at,
+    )
+    for clause in _users_where_clauses(query, role):
+        stmt = stmt.where(clause)
+    stmt = (
+        stmt.order_by(
+            case((users_table.c.role == "admin", 0), else_=1),
+            func.lower(users_table.c.full_name),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    return conn.execute(stmt).mappings().all()
+
+
+def list_admin_audit(conn, limit: int = 20):
+    return conn.execute(
+        text(
+            """SELECT action, actor_email, target_email, created_at
+               FROM admin_audit_log ORDER BY id DESC LIMIT :limit"""
+        ),
+        {"limit": limit},
+    ).mappings().all()
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +781,13 @@ def _register_failed_login(conn, email, now=None) -> None:
 
 
 def _clear_login_attempts(conn, email) -> None:
+    """Zera o contador de tentativas do e-mail. Não commita — quem chama
+    decide a transação, para o reset de senha e a liberação do bloqueio
+    caírem juntos (ver admin_reset_password)."""
     conn.execute(
         text("DELETE FROM login_attempts WHERE email = :email"),
         {"email": (email or "").lower().strip()},
     )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +968,6 @@ def delete_book(conn, book_id) -> None:
 # Busca, filtros e paginação de livros (tudo resolvido no banco)
 # ---------------------------------------------------------------------------
 
-BOOKS_PAGE_SIZE = 25
 CATEGORY_FILTER_ALL = "Todas"
 STATUS_FILTER_ALL = "Todos"
 
@@ -795,7 +1051,7 @@ def list_books(
     query: str = "",
     category: str | None = None,
     status: str | None = None,
-    limit: int = BOOKS_PAGE_SIZE,
+    limit: int = PAGE_SIZE,
     offset: int = 0,
     newest_first: bool = False,
 ):
@@ -1223,6 +1479,7 @@ def show_auth_screen(conn):
                     user = authenticate(conn, email, password)
                     if user:
                         _clear_login_attempts(conn, email)
+                        conn.commit()
                         st.session_state.user = _session_user_view(user)
                         st.rerun()
                     else:
@@ -1340,12 +1597,12 @@ def _paginate(total: int, key_prefix: str) -> int:
     página atual, mantendo a página escolhida em session_state e
     reposicionando quando os filtros encolhem o resultado."""
     page_key = f"{key_prefix}_page"
-    total_pages = max(1, (total + BOOKS_PAGE_SIZE - 1) // BOOKS_PAGE_SIZE)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(st.session_state.get(page_key, 1), total_pages)
     st.session_state[page_key] = page
 
-    first = (page - 1) * BOOKS_PAGE_SIZE + 1
-    last = min(page * BOOKS_PAGE_SIZE, total)
+    first = (page - 1) * PAGE_SIZE + 1
+    last = min(page * PAGE_SIZE, total)
 
     col_prev, col_info, col_next = st.columns([1, 3, 1])
     if col_prev.button(
@@ -1364,7 +1621,7 @@ def _paginate(total: int, key_prefix: str) -> int:
         st.session_state[page_key] = page + 1
         st.rerun()
 
-    return (page - 1) * BOOKS_PAGE_SIZE
+    return (page - 1) * PAGE_SIZE
 
 
 def show_catalog(conn, user):
@@ -1556,7 +1813,7 @@ def count_unreconciled_books(conn, query: str = "") -> int:
 
 
 def list_unreconciled_books(
-    conn, query: str = "", limit: int = BOOKS_PAGE_SIZE, offset: int = 0
+    conn, query: str = "", limit: int = PAGE_SIZE, offset: int = 0
 ):
     stmt = select(books_table)
     for clause in _unreconciled_where(query):
@@ -2078,6 +2335,181 @@ def show_admin_dashboard(conn):
     )
 
 
+# ---------------------------------------------------------------------------
+# Gestão de usuários (admin): reset de senha presencial e cadastro de admins
+# ---------------------------------------------------------------------------
+
+# Onde a senha temporária recém-gerada espera para ser exibida. Vive só no
+# session_state do admin que fez o reset, e some no primeiro clique depois
+# disso — o banco guarda apenas o hash, então esta é literalmente a única
+# chance de ler a senha em texto puro.
+RESET_RESULT_KEY = "password_reset_result"
+
+SINGLE_ADMIN_WARNING = (
+    "⚠️ **Este é o único administrador do sistema.** Se esta senha for perdida, "
+    "não há como recuperar o acesso administrativo pela aplicação — a recuperação "
+    "de senha depende de outro admin fazer a redefinição. Cadastre um segundo "
+    "administrador agora, no formulário abaixo."
+)
+
+
+def _render_reset_result() -> None:
+    """Painel da senha temporária gerada no último reset (se houver)."""
+    result = st.session_state.get(RESET_RESULT_KEY)
+    if not result:
+        return
+    st.success(
+        f"Senha redefinida para **{result['full_name']}** ({result['email']})."
+    )
+    st.warning(
+        "Anote ou entregue esta senha agora — ela **não será exibida de novo** "
+        "e não pode ser consultada depois (o sistema guarda só o hash). O "
+        "usuário será obrigado a trocá-la no próximo login."
+    )
+    st.code(result["password"], language=None)
+    if st.button("Já anotei — ocultar senha", key="dismiss_reset_result"):
+        del st.session_state[RESET_RESULT_KEY]
+        st.rerun()
+
+
+def _render_new_admin_form(conn) -> None:
+    with st.expander("➕ Cadastrar novo administrador"):
+        st.caption(
+            "Contas de administrador não podem ser criadas pela tela de cadastro "
+            "(que só cria leitores). A senha definida aqui é provisória: o novo "
+            "admin é obrigado a trocá-la no primeiro login."
+        )
+        with st.form("new_admin_form"):
+            full_name = st.text_input("Nome completo", key="new_admin_name")
+            email = st.text_input("E-mail", key="new_admin_email")
+            phone = st.text_input("Telefone/WhatsApp", key="new_admin_phone")
+            password = st.text_input(
+                "Senha provisória", type="password", key="new_admin_password"
+            )
+            if st.form_submit_button("Cadastrar administrador"):
+                has_error = False
+                if not full_name.strip():
+                    st.error("Nome completo é obrigatório.")
+                    has_error = True
+                if not is_valid_email(email):
+                    st.error("E-mail inválido. Informe um endereço no formato nome@dominio.com.")
+                    has_error = True
+                strength_error = password_strength_error(password)
+                if strength_error:
+                    st.error(strength_error)
+                    has_error = True
+                if not has_error and get_user_by_email(conn, email):
+                    st.error("Já existe um cadastro com esse e-mail.")
+                    has_error = True
+                if not has_error:
+                    success, error_message = try_create_account(
+                        conn, full_name, email, phone, password, "admin",
+                        must_change_password=True,
+                    )
+                    if success:
+                        st.success(
+                            f"Administrador **{full_name}** cadastrado. Ele precisará "
+                            "trocar a senha no primeiro login."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(error_message)
+
+
+def _render_password_reset(conn, current_user, row) -> None:
+    """Bloco 'Redefinir senha' de um usuário na listagem."""
+    st.markdown("---")
+    st.markdown("**Redefinir senha**")
+
+    if row["id"] == current_user["id"]:
+        st.caption(
+            "Para trocar a sua própria senha, use **Alterar minha senha** no menu "
+            "— redefinir a si mesmo encerraria esta sessão no mesmo instante."
+        )
+        return
+
+    st.caption(
+        "Gera uma senha temporária para entregar ao usuário presencialmente. A "
+        "senha antiga deixa de valer imediatamente, a sessão que ele tiver aberta "
+        "é encerrada e a troca é obrigatória no próximo login."
+    )
+    new_password = st.text_input(
+        "Nova senha temporária (opcional)",
+        type="password",
+        key=f"reset_pw_{row['id']}",
+        help="Deixe em branco para o sistema gerar uma senha aleatória.",
+    )
+    confirm = st.checkbox(
+        f"Confirmo a redefinição da senha de **{row['full_name']}** ({row['email']}).",
+        key=f"confirm_reset_{row['id']}",
+    )
+    if st.button(
+        "🔑 Redefinir senha",
+        key=f"reset_{row['id']}",
+        disabled=not confirm,
+    ):
+        try:
+            temp_password = admin_reset_password(
+                conn, current_user, row["id"], new_password or None
+            )
+        except ValueError as exc:
+            conn.rollback()
+            st.error(f"Não foi possível redefinir a senha: {exc}")
+        else:
+            st.session_state[RESET_RESULT_KEY] = {
+                "full_name": row["full_name"],
+                "email": row["email"],
+                "password": temp_password,
+            }
+            st.rerun()
+
+
+def show_user_management(conn, current_user):
+    st.header("Gestão de Usuários")
+
+    if count_admins(conn) <= 1:
+        st.warning(SINGLE_ADMIN_WARNING)
+
+    _render_reset_result()
+    _render_new_admin_form(conn)
+
+    st.subheader("Usuários cadastrados")
+    query = st.text_input("Buscar por nome, e-mail ou telefone", key="users_query")
+
+    total = count_users(conn, query)
+    if total:
+        offset = _paginate(total, "users")
+        for row in list_users(conn, query, offset=offset):
+            is_admin = row["role"] == "admin"
+            icon = "🛡️" if is_admin else "👤"
+            with st.expander(f"{icon} {row['full_name']} — {row['email']}"):
+                st.caption(
+                    f"Perfil: **{'Administrador' if is_admin else 'Leitor'}** · "
+                    f"Telefone: {row['phone'] or '—'} · "
+                    f"Cadastro: {row['created_at'][:10]}"
+                )
+                if row["must_change_password"]:
+                    st.info("Troca de senha pendente no próximo login.")
+                _render_password_reset(conn, current_user, row)
+    else:
+        st.info("Nenhum usuário encontrado.")
+
+    with st.expander("🗒️ Auditoria de redefinições de senha"):
+        resets = [
+            {
+                "Quando": e["created_at"].replace("T", " "),
+                "Quem redefiniu": e["actor_email"],
+                "Senha de": e["target_email"],
+            }
+            for e in list_admin_audit(conn)
+            if e["action"] == AUDIT_ACTION_PASSWORD_RESET
+        ]
+        if resets:
+            st.dataframe(resets, hide_index=True, width="stretch")
+        else:
+            st.caption("Nenhuma redefinição de senha registrada até agora.")
+
+
 def show_loan_reconciliation(conn):
     st.header("Reconciliação de empréstimos")
     st.caption(
@@ -2321,6 +2753,7 @@ def show_app(conn):
                     "Reconciliação",
                     "Histórico completo",
                     "Importar CSV",
+                    "Gestão de Usuários",
                     "Alterar minha senha",
                 ],
             )
@@ -2346,6 +2779,8 @@ def show_app(conn):
         show_my_loans(conn, user)
     elif page == "Importar CSV":
         show_csv_import(conn)
+    elif page == "Gestão de Usuários":
+        show_user_management(conn, user)
     elif page == "Alterar minha senha":
         show_change_password_screen(conn, user)
 
@@ -2410,7 +2845,22 @@ def main():
         st.session_state.user = None
 
     with get_connection() as conn:
+        # A sessão é reconferida contra o banco a cada rerun: se um admin
+        # redefiniu esta senha (ou a conta sumiu), a aba que ficou aberta com
+        # a senha antiga cai aqui, em vez de continuar navegando.
+        if st.session_state.user is not None and not _session_is_current(
+            conn, st.session_state.user
+        ):
+            st.session_state.user = None
+            st.session_state.session_revoked = True
+
         if st.session_state.user is None:
+            if st.session_state.pop("session_revoked", False):
+                st.warning(
+                    "Sua sessão foi encerrada porque a senha desta conta foi "
+                    "redefinida por um administrador. Entre novamente com a "
+                    "senha temporária que você recebeu."
+                )
             show_auth_screen(conn)
         elif st.session_state.user.get("must_change_password"):
             show_change_password_screen(conn, st.session_state.user, forced=True)

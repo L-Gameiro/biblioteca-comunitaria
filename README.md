@@ -76,12 +76,27 @@ automaticamente no Postgres, junto com o usuário administrador padrão. O
 catálogo começa **vazio**: os livros entram pela carga real do acervo, seja
 pelo cadastro manual (**Gestão de Livros**) ou pela **Importação via CSV**.
 
-### Credenciais do administrador padrão
+### Administrador padrão do primeiro boot
 
-| Campo | Valor |
-|---|---|
-| E-mail | `admin@biblioteca.org` |
-| Senha  | `admin123` |
+No primeiro boot — e sempre que o banco não tiver **nenhuma** conta de
+administrador — o sistema cria automaticamente um administrador padrão, já
+marcado com `must_change_password`: ele cai direto na tela **Alterar minha
+senha** e não acessa nenhuma outra tela até definir uma senha nova.
+
+As credenciais iniciais dessa conta estão **no código-fonte**, em
+`_ensure_initialized` (`app.py`) — este README não as repete de propósito.
+Quem faz o deploy consulta o código; quem só lê a documentação não recebe uma
+senha pronta para usar.
+
+> **Troque a senha logo no primeiro acesso.** A troca obrigatória fecha a
+> maior parte do risco, mas ela só acontece quando alguém loga: entre um boot
+> que recriou o admin e o primeiro login, a conta ainda está com a senha
+> inicial. Faça esse login como primeira etapa do deploy, e depois cadastre um
+> segundo administrador (ver
+> [Proteção contra perda de acesso administrativo](#proteção-contra-perda-de-acesso-administrativo)).
+
+Se a senha se perder depois disso, a recuperação está descrita em
+[Recuperação de senha](#recuperação-de-senha).
 
 ### Banco local antigo (SQLite)
 
@@ -93,6 +108,135 @@ antigo por aí, pode apagá-lo com segurança:
 ```bash
 rm -f biblioteca.db
 ```
+
+## Recuperação de senha
+
+Não existe fluxo de "esqueci minha senha" por e-mail — ver
+[Por que não há recuperação por e-mail](#por-que-não-há-recuperação-por-e-mail).
+A recuperação é **presencial**: um administrador redefine a senha e entrega
+uma senha temporária ao usuário.
+
+### Redefinindo a senha de um usuário (tela **Gestão de Usuários**)
+
+1. No menu do admin, abra **Gestão de Usuários** e localize a pessoa (busca
+   por nome, e-mail ou telefone — sem acento também encontra).
+2. Abra o registro dela e vá em **Redefinir senha**. Deixe o campo de senha em
+   branco para o sistema gerar uma senha aleatória, ou digite uma senha
+   provisória combinada na hora.
+3. Marque a confirmação (o botão só habilita depois disso) e clique em
+   **🔑 Redefinir senha**.
+4. A senha temporária aparece **uma única vez** na tela. Anote ou entregue
+   naquele momento: o banco guarda apenas o hash, então ela não pode ser
+   consultada depois. Se você perder a senha antes de repassá-la, é só
+   redefinir de novo.
+
+O que acontece na conta redefinida:
+
+| Efeito | Detalhe |
+|---|---|
+| Senha antiga deixa de valer | O hash é substituído na hora. |
+| Troca obrigatória | A conta fica com `must_change_password = 1` e cai na tela **Alterar minha senha** no próximo login, sem acesso a nenhuma outra tela até concluir. |
+| Sessão aberta é encerrada | `users.session_version` é incrementado; a sessão que a pessoa tiver aberta em outra aba cai na tela de login no clique seguinte, com aviso — a senha antiga não continua valendo em lugar nenhum. |
+| Bloqueio por força bruta é liberado | Quem esqueceu a senha normalmente errou várias vezes antes de pedir ajuda; sem isso a senha temporária não funcionaria até o bloqueio expirar. |
+| Auditoria | Fica registrado em `admin_audit_log` quem redefiniu a senha de quem e quando (visível no fim da própria tela, em **🗒️ Auditoria de redefinições de senha**). |
+
+Um admin **não** redefine a própria senha por essa tela — isso encerraria a
+sessão dele no mesmo instante. Para a própria senha, use **Alterar minha
+senha** no menu.
+
+## Proteção contra perda de acesso administrativo
+
+Um admin pode redefinir a senha de outro admin — é assim que o acesso
+administrativo se recupera dentro da aplicação. Mas isso só funciona se
+**existir mais de um administrador**: o bootstrap automático só recria a conta
+`admin@biblioteca.org` quando **não há nenhum admin** no banco, então um único
+admin com a senha perdida trava o sistema inteiro.
+
+Por isso, enquanto houver só um administrador, a tela **Gestão de Usuários**
+exibe um aviso recomendando cadastrar o segundo. Use o formulário
+**➕ Cadastrar novo administrador** na mesma tela (a tela pública de cadastro
+só cria leitores). A senha definida ali é provisória: o novo admin é obrigado
+a trocá-la no primeiro login.
+
+### Procedimento de emergência: nenhum admin acessível
+
+Se ninguém mais consegue entrar como administrador, a recuperação é feita do
+**ambiente local**, com a `DATABASE_URL` de produção em mãos.
+
+> **Não adianta editar o `password_hash` direto no banco.** A coluna guarda um
+> hash **bcrypt** — escrever a senha em texto puro ali não autentica ninguém, e
+> um hash colado de outro lugar precisaria vir com o `salt` correspondente e
+> ainda deixaria `must_change_password` e `session_version` inconsistentes. Use
+> as funções do próprio app, que fazem tudo junto.
+
+**Caso 1 — a conta admin existe, mas a senha se perdeu.** Rode a partir da raiz
+do repositório, com o venv ativado:
+
+```python
+# recuperar_admin.py
+from app import admin_reset_password, get_connection, get_user_by_email
+
+DATABASE_URL = "postgresql://..."      # a mesma do .streamlit/secrets.toml
+OPERADOR = {"id": None, "email": "recuperacao-local@cli"}   # aparece na auditoria
+
+with get_connection(DATABASE_URL) as conn:
+    admin = get_user_by_email(conn, "admin@biblioteca.org")
+    print("senha temporária:", admin_reset_password(conn, OPERADOR, admin["id"]))
+```
+
+```bash
+python recuperar_admin.py
+```
+
+Entre com a senha impressa; o app exige a troca no primeiro login. A operação
+fica registrada na auditoria com o e-mail fictício do operador local, deixando
+claro que foi uma recuperação por fora da aplicação.
+
+**Caso 2 — não existe nenhuma conta admin no banco** (removida, migração,
+anonimização). Basta subir o app: o bootstrap detecta a ausência de admin e
+recria a conta padrão (credenciais em `_ensure_initialized`, no código-fonte),
+já marcada para troca obrigatória. Para forçar isso sem subir a interface:
+
+```bash
+python -c "from app import init_db; init_db('postgresql://...')"
+```
+
+Se preferir não passar pelo padrão, crie o admin já com a senha desejada:
+
+```python
+# criar_admin.py
+from app import get_connection, try_create_account
+
+DATABASE_URL = "postgresql://..."
+
+with get_connection(DATABASE_URL) as conn:
+    print(try_create_account(
+        conn, "Administrador", "admin@biblioteca.org", "",
+        "TROQUE-POR-UMA-SENHA-FORTE", "admin", must_change_password=True,
+    ))
+```
+
+### Por que não há recuperação por e-mail
+
+Um fluxo de "esqueci minha senha" por link enviado ao e-mail foi
+deliberadamente deixado de fora deste protótipo. Ele exigiria, para ser seguro
+e não virar um vetor de ataque:
+
+- um servidor SMTP (ou serviço transacional) configurado e com domínio
+  verificado, mais o segredo correspondente no deploy;
+- uma tabela de tokens de reset — de uso único, com expiração curta e
+  guardados como hash, não em texto puro;
+- proteção contra enumeração de contas: a resposta da tela precisa ser
+  idêntica para e-mail cadastrado e não cadastrado, e o envio precisa de rate
+  limit próprio, senão o formulário vira um oráculo de quem é usuário;
+- tratamento de entrega (bounce, spam, caixa cheia) — sem isso o usuário fica
+  sem senha e sem aviso.
+
+Para a escala do Centro Cultural Esplanada, onde o atendimento já é presencial,
+o reset feito pelo admin resolve o mesmo problema sem nenhuma dessas peças.
+**Evolução futura:** se o app passar a atender pessoas remotas, o fluxo por
+e-mail entra como complemento — não como substituto — do reset presencial, que
+continua sendo o caminho de recuperação do acesso administrativo.
 
 ## Deploy no Streamlit Community Cloud
 

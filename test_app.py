@@ -22,18 +22,29 @@ from sqlalchemy import text
 
 import app
 from app import (
+    AUDIT_ACTION_PASSWORD_RESET,
     BookCodeAllocator,
     CATEGORY_FILTER_ALL,
     CODE_STRATEGY_AUTHOR,
     CODE_STRATEGY_NUMERIC,
     MAX_LOGIN_ATTEMPTS,
+    MIN_PASSWORD_LENGTH,
     STATUS_FILTER_ALL,
     _clear_login_attempts,
     _detect_csv_delimiter,
     _hash_password_legacy,
     _login_locked_until,
     _register_failed_login,
+    _session_is_current,
     add_book,
+    admin_reset_password,
+    authenticate,
+    count_admins,
+    count_users,
+    generate_temporary_password,
+    list_admin_audit,
+    list_users,
+    try_create_account,
     apply_column_mapping,
     change_password,
     count_books,
@@ -751,8 +762,8 @@ def test_login_admin_bootstrap_fica_bloqueado_ate_trocar_a_senha(tmp_path, monke
 def test_migracao_forca_troca_de_senha_para_admin_ja_existente_em_producao(tmp_path):
     """Banco criado antes deste recurso: a migração precisa marcar
     must_change_password=1 para contas admin já existentes, porque a única
-    senha que elas puderam ter é a padrão exposta na tela antiga (admin123).
-    Contas leitor não são afetadas."""
+    senha que elas puderam ter é a padrão do bootstrap, que ficava exposta na
+    tela de login antiga. Contas leitor não são afetadas."""
     import sqlite3
 
     db_path = tmp_path / "legado_admin.db"
@@ -2580,3 +2591,510 @@ def test_loan_summary_uma_unica_query_para_a_pagina_inteira(conn):
         event.remove(Engine, "before_cursor_execute", _conta)
 
     assert contador["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Recuperação de senha: reset presencial feito pelo administrador
+# (não há fluxo por e-mail — ver README, seção "Recuperação de senha")
+# ---------------------------------------------------------------------------
+
+def _admin_e_leitor(conn):
+    """Um admin (o ator) e um leitor (o alvo), já commitados."""
+    create_user(conn, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+    create_user(conn, "Maria Souza", "maria@teste.org", "", "senhaAntiga1", "leitor")
+    conn.commit()
+    return (
+        get_user_by_email(conn, "admin1@teste.org"),
+        get_user_by_email(conn, "maria@teste.org"),
+    )
+
+
+def test_reset_gera_senha_temporaria_e_marca_troca_obrigatoria(conn):
+    admin, maria = _admin_e_leitor(conn)
+
+    temporaria = admin_reset_password(conn, admin, maria["id"])
+
+    assert password_strength_error(temporaria) is None
+    depois = get_user_by_email(conn, "maria@teste.org")
+    assert verify_password(temporaria, depois["password_hash"], depois["salt"])
+    assert bool(depois["must_change_password"]) is True
+
+
+def test_reset_invalida_a_senha_antiga(conn):
+    """O ponto central: depois do reset a senha anterior não abre mais a conta."""
+    admin, maria = _admin_e_leitor(conn)
+    assert authenticate(conn, "maria@teste.org", "senhaAntiga1") is not None
+
+    admin_reset_password(conn, admin, maria["id"])
+
+    assert authenticate(conn, "maria@teste.org", "senhaAntiga1") is None
+    depois = get_user_by_email(conn, "maria@teste.org")
+    assert not verify_password("senhaAntiga1", depois["password_hash"], depois["salt"])
+
+
+def test_reset_aceita_senha_definida_pelo_admin_e_recusa_senha_fraca(conn):
+    admin, maria = _admin_e_leitor(conn)
+
+    escolhida = admin_reset_password(conn, admin, maria["id"], "SenhaEscolhida9")
+    assert escolhida == "SenhaEscolhida9"
+    depois = get_user_by_email(conn, "maria@teste.org")
+    assert verify_password("SenhaEscolhida9", depois["password_hash"], depois["salt"])
+
+    with pytest.raises(ValueError):
+        admin_reset_password(conn, admin, maria["id"], "curta")
+    # a senha fraca não pode ter sido gravada
+    ainda = get_user_by_email(conn, "maria@teste.org")
+    assert verify_password("SenhaEscolhida9", ainda["password_hash"], ainda["salt"])
+
+
+def test_reset_de_usuario_inexistente_levanta_erro(conn):
+    admin, _ = _admin_e_leitor(conn)
+    with pytest.raises(ValueError):
+        admin_reset_password(conn, admin, 999999)
+
+
+def test_admin_redefine_senha_de_outro_admin(conn):
+    """Proteção contra perda de acesso administrativo: o segundo admin é
+    justamente quem consegue devolver o acesso a quem esqueceu a senha."""
+    create_user(conn, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+    create_user(conn, "Admin Dois", "admin2@teste.org", "", "SenhaAdmin2", "admin")
+    conn.commit()
+    ator = get_user_by_email(conn, "admin1@teste.org")
+    esquecido = get_user_by_email(conn, "admin2@teste.org")
+
+    temporaria = admin_reset_password(conn, ator, esquecido["id"])
+
+    assert authenticate(conn, "admin2@teste.org", "SenhaAdmin2") is None
+    recuperado = authenticate(conn, "admin2@teste.org", temporaria)
+    assert recuperado is not None
+    assert recuperado["role"] == "admin"
+    assert bool(recuperado["must_change_password"]) is True
+
+
+def test_reset_registra_na_auditoria_quem_redefiniu_de_quem_e_quando(conn):
+    admin, maria = _admin_e_leitor(conn)
+
+    antes = datetime.now().replace(microsecond=0)
+    admin_reset_password(conn, admin, maria["id"])
+
+    entradas = list_admin_audit(conn)
+    assert len(entradas) == 1
+    registro = entradas[0]
+    assert registro["action"] == AUDIT_ACTION_PASSWORD_RESET
+    assert registro["actor_email"] == "admin1@teste.org"
+    assert registro["target_email"] == "maria@teste.org"
+    assert datetime.fromisoformat(registro["created_at"]) >= antes
+
+
+def test_auditoria_mantem_ordem_mais_recente_primeiro(conn):
+    admin, maria = _admin_e_leitor(conn)
+    create_user(conn, "Joao", "joao@teste.org", "", "senhaJoao12", "leitor")
+    conn.commit()
+    joao = get_user_by_email(conn, "joao@teste.org")
+
+    admin_reset_password(conn, admin, maria["id"])
+    admin_reset_password(conn, admin, joao["id"])
+
+    alvos = [e["target_email"] for e in list_admin_audit(conn)]
+    assert alvos == ["joao@teste.org", "maria@teste.org"]
+
+
+def test_reset_libera_conta_travada_pelo_rate_limit(conn):
+    """Quem esqueceu a senha normalmente errou várias vezes antes de pedir
+    ajuda — a senha temporária tem que funcionar na hora, sem esperar o
+    bloqueio de força bruta expirar."""
+    admin, maria = _admin_e_leitor(conn)
+    for _ in range(MAX_LOGIN_ATTEMPTS):
+        _register_failed_login(conn, "maria@teste.org")
+    assert _login_locked_until(conn, "maria@teste.org") is not None
+
+    temporaria = admin_reset_password(conn, admin, maria["id"])
+
+    assert _login_locked_until(conn, "maria@teste.org") is None
+    assert authenticate(conn, "maria@teste.org", temporaria) is not None
+
+
+def test_senha_temporaria_gerada_e_forte_aleatoria_e_sem_caracteres_ambiguos(conn):
+    senhas = {generate_temporary_password() for _ in range(50)}
+    assert len(senhas) == 50  # aleatória de verdade, não um valor fixo
+    for senha in senhas:
+        assert password_strength_error(senha) is None
+        assert len(senha) >= MIN_PASSWORD_LENGTH
+        assert not (set(senha) & set("0O1lI"))
+
+
+# ---------------------------------------------------------------------------
+# Invalidação da sessão ativa do usuário cuja senha foi redefinida
+# ---------------------------------------------------------------------------
+
+def test_session_is_current_derruba_sessao_apos_reset(conn):
+    admin, maria = _admin_e_leitor(conn)
+    sessao = app._session_user_view(maria)
+    assert _session_is_current(conn, sessao) is True
+
+    admin_reset_password(conn, admin, maria["id"])
+
+    assert _session_is_current(conn, sessao) is False
+
+
+def test_session_is_current_falso_para_conta_removida(conn):
+    admin, maria = _admin_e_leitor(conn)
+    sessao = app._session_user_view(maria)
+    conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": maria["id"]})
+    conn.commit()
+
+    assert _session_is_current(conn, sessao) is False
+
+
+def test_session_is_current_sobrevive_a_troca_de_senha_do_proprio_usuario(conn):
+    """Trocar a própria senha não pode derrubar a sessão de quem está
+    trocando — só o reset feito por um admin invalida."""
+    _, maria = _admin_e_leitor(conn)
+    sessao = app._session_user_view(maria)
+
+    assert change_password(conn, maria["id"], "senhaAntiga1", "senhaNova123") is True
+
+    assert _session_is_current(conn, sessao) is True
+
+
+def test_sessao_aberta_em_outra_aba_cai_no_proximo_clique(tmp_path, monkeypatch):
+    """Ponta a ponta: a leitora está logada; um admin redefine a senha dela
+    pelo banco (como faria em outra aba) e o próximo rerun da sessão dela cai
+    na tela de login com o aviso, em vez de continuar navegando."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/sessao_revogada.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+
+    with get_connection(database_url) as connection:
+        create_schema(get_engine(database_url))
+        create_user(connection, "Maria", "maria@teste.org", "", "senhaAntiga1", "leitor")
+        create_user(connection, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+        connection.commit()
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    at.text_input(key="login_email").input("maria@teste.org")
+    at.text_input(key="login_password").input("senhaAntiga1")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+    assert at.radio  # dentro do app, menu do leitor à mostra
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin1@teste.org")
+        maria = get_user_by_email(connection, "maria@teste.org")
+        temporaria = admin_reset_password(connection, admin, maria["id"])
+
+    at.run()  # próximo clique na aba que ficou aberta
+    assert not at.exception, at.exception
+    assert not at.radio  # menu sumiu: voltou para a tela de login
+    assert any("sessão foi encerrada" in (w.value or "") for w in at.warning)
+
+    # e a senha antiga não reabre a sessão; a temporária cai na troca obrigatória
+    at.text_input(key="login_email").input("maria@teste.org")
+    at.text_input(key="login_password").input("senhaAntiga1")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert any("E-mail ou senha inválidos" in (e.value or "") for e in at.error)
+
+    at.text_input(key="login_email").input("maria@teste.org")
+    at.text_input(key="login_password").input(temporaria)
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == "Alterar minha senha"
+
+
+# ---------------------------------------------------------------------------
+# Tela "Gestão de Usuários" (admin)
+# ---------------------------------------------------------------------------
+
+def _abre_gestao_de_usuarios(tmp_path, monkeypatch, nome_db):
+    """Sobe o app, loga como admin do bootstrap (concluindo a troca forçada)
+    e navega até a tela de Gestão de Usuários."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/{nome_db}.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    _login_as_admin_and_complete_forced_password_change(at)
+    at.radio[0].set_value("Gestão de Usuários").run()
+    assert not at.exception, at.exception
+    return at, database_url
+
+
+def test_tela_avisa_quando_ha_apenas_um_administrador(tmp_path, monkeypatch):
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "um_admin")
+
+    assert at.header[0].value == "Gestão de Usuários"
+    assert any("único administrador" in (w.value or "") for w in at.warning)
+
+    with get_connection(database_url) as connection:
+        assert count_admins(connection) == 1
+
+
+def test_aviso_de_admin_unico_some_apos_cadastrar_o_segundo(tmp_path, monkeypatch):
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "dois_admins")
+    assert any("único administrador" in (w.value or "") for w in at.warning)
+
+    at.text_input(key="new_admin_name").input("Segunda Admin")
+    at.text_input(key="new_admin_email").input("segunda@teste.org")
+    at.text_input(key="new_admin_password").input("SenhaSegunda1")
+    at.button(key="FormSubmitter:new_admin_form-Cadastrar administrador").click().run()
+    assert not at.exception, at.exception
+
+    assert not any("único administrador" in (w.value or "") for w in at.warning)
+    with get_connection(database_url) as connection:
+        assert count_admins(connection) == 2
+        nova = get_user_by_email(connection, "segunda@teste.org")
+        assert nova["role"] == "admin"
+        # nasce obrigada a trocar a senha provisória definida pelo outro admin
+        assert bool(nova["must_change_password"]) is True
+
+
+def test_tela_redefine_senha_exigindo_confirmacao_e_mostra_a_senha_uma_vez(
+    tmp_path, monkeypatch
+):
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "reset_tela")
+
+    with get_connection(database_url) as connection:
+        create_user(connection, "Maria Souza", "maria@teste.org", "", "senhaAntiga1", "leitor")
+        connection.commit()
+        maria = get_user_by_email(connection, "maria@teste.org")
+
+    at.run()
+    # sem marcar a confirmação, o botão de redefinir fica desabilitado
+    botao = at.button(key=f"reset_{maria['id']}")
+    assert botao.disabled is True
+
+    at.checkbox(key=f"confirm_reset_{maria['id']}").check().run()
+    at.button(key=f"reset_{maria['id']}").click().run()
+    assert not at.exception, at.exception
+
+    assert any("Senha redefinida" in (s.value or "") for s in at.success)
+    temporaria = at.code[0].value
+    assert password_strength_error(temporaria) is None
+
+    with get_connection(database_url) as connection:
+        depois = get_user_by_email(connection, "maria@teste.org")
+        assert verify_password(temporaria, depois["password_hash"], depois["salt"])
+        assert not verify_password("senhaAntiga1", depois["password_hash"], depois["salt"])
+        assert bool(depois["must_change_password"]) is True
+
+    # exibida uma única vez: ao ocultar, a senha some da tela e não volta
+    at.button(key="dismiss_reset_result").click().run()
+    assert not at.code
+
+
+def test_tela_nao_oferece_reset_para_a_propria_conta_do_admin(tmp_path, monkeypatch):
+    """Redefinir a si mesmo encerraria a própria sessão no mesmo instante —
+    a tela manda usar 'Alterar minha senha'."""
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "auto_reset")
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@biblioteca.org")
+
+    assert not [b for b in at.button if b.key == f"reset_{admin['id']}"]
+    assert any(
+        "Alterar minha senha" in (c.value or "") for c in at.caption
+    )
+
+
+def test_tela_permite_admin_redefinir_senha_de_outro_admin(tmp_path, monkeypatch):
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "reset_admin")
+
+    with get_connection(database_url) as connection:
+        create_user(connection, "Admin Dois", "admin2@teste.org", "", "SenhaAdmin2", "admin")
+        connection.commit()
+        outro = get_user_by_email(connection, "admin2@teste.org")
+
+    at.run()
+    at.checkbox(key=f"confirm_reset_{outro['id']}").check().run()
+    at.button(key=f"reset_{outro['id']}").click().run()
+    assert not at.exception, at.exception
+
+    temporaria = at.code[0].value
+    with get_connection(database_url) as connection:
+        assert authenticate(connection, "admin2@teste.org", "SenhaAdmin2") is None
+        recuperado = authenticate(connection, "admin2@teste.org", temporaria)
+        assert recuperado is not None and recuperado["role"] == "admin"
+        registros = list_admin_audit(connection)
+        assert registros[0]["actor_email"] == "admin@biblioteca.org"
+        assert registros[0]["target_email"] == "admin2@teste.org"
+
+
+def test_login_com_senha_temporaria_cai_na_troca_obrigatoria(tmp_path, monkeypatch):
+    """Fluxo completo do usuário que esqueceu a senha: recebe a temporária do
+    admin, entra, é obrigado a trocar e só então usa o sistema."""
+    from streamlit.testing.v1 import AppTest
+
+    at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "fluxo_completo")
+
+    with get_connection(database_url) as connection:
+        create_user(connection, "Maria Souza", "maria@teste.org", "", "senhaAntiga1", "leitor")
+        connection.commit()
+        maria = get_user_by_email(connection, "maria@teste.org")
+
+    at.run()
+    at.checkbox(key=f"confirm_reset_{maria['id']}").check().run()
+    at.button(key=f"reset_{maria['id']}").click().run()
+    temporaria = at.code[0].value
+
+    leitora = AppTest.from_file("app.py")
+    leitora.run()
+    leitora.text_input(key="login_email").input("maria@teste.org")
+    leitora.text_input(key="login_password").input(temporaria)
+    leitora.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not leitora.exception, leitora.exception
+
+    # troca obrigatória: só a tela de senha, sem menu do sistema
+    assert leitora.title[0].value == "Alterar minha senha"
+    assert not leitora.radio
+
+    leitora.text_input(key="cp_current").input(temporaria)
+    leitora.text_input(key="cp_new").input("MinhaSenhaNova9")
+    leitora.text_input(key="cp_confirm").input("MinhaSenhaNova9")
+    leitora.button(
+        key="FormSubmitter:change_password_form-Salvar nova senha"
+    ).click().run()
+    assert not leitora.exception, leitora.exception
+
+    assert leitora.radio  # liberada no app
+    with get_connection(database_url) as connection:
+        depois = get_user_by_email(connection, "maria@teste.org")
+        assert bool(depois["must_change_password"]) is False
+        assert verify_password("MinhaSenhaNova9", depois["password_hash"], depois["salt"])
+        assert not verify_password(temporaria, depois["password_hash"], depois["salt"])
+
+
+# ---------------------------------------------------------------------------
+# Listagem de usuários da tela de gestão
+# ---------------------------------------------------------------------------
+
+def test_list_users_traz_admins_primeiro_e_busca_sem_acento(conn):
+    create_user(conn, "Zulmira Alves", "zulmira@teste.org", "", "senhaZulmira", "leitor")
+    create_user(conn, "José Antônio", "jose@teste.org", "11999", "senhaJose123", "leitor")
+    create_user(conn, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+    conn.commit()
+
+    todos = list_users(conn)
+    assert [u["email"] for u in todos] == [
+        "admin1@teste.org",  # admins primeiro
+        "jose@teste.org",    # depois por nome
+        "zulmira@teste.org",
+    ]
+    # nunca devolve material de senha para a tela
+    assert "password_hash" not in todos[0].keys()
+    assert "salt" not in todos[0].keys()
+
+    assert [u["email"] for u in list_users(conn, "jose")] == ["jose@teste.org"]
+    assert [u["email"] for u in list_users(conn, "ANTONIO")] == ["jose@teste.org"]
+    assert [u["email"] for u in list_users(conn, "11999")] == ["jose@teste.org"]
+    assert count_users(conn, "jose") == 1
+    assert count_users(conn) == 3
+
+
+def test_count_admins_conta_somente_administradores(conn):
+    assert count_admins(conn) == 0
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senhaLeitor1", "leitor")
+    conn.commit()
+    assert count_admins(conn) == 0
+    create_user(conn, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+    conn.commit()
+    assert count_admins(conn) == 1
+
+
+def test_try_create_account_recusa_email_duplicado(conn):
+    ok, erro = try_create_account(
+        conn, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin"
+    )
+    assert ok is True and erro is None
+
+    ok, erro = try_create_account(
+        conn, "Outro", "admin1@teste.org", "", "OutraSenha1", "admin"
+    )
+    assert ok is False
+    assert "mesmo e-mail" in erro or "esse e-mail" in erro
+    assert count_admins(conn) == 1
+
+
+def test_migracao_adiciona_session_version_sem_deslogar_ninguem(tmp_path):
+    """Banco criado antes deste recurso: a coluna entra com 0 em todas as
+    contas, que é o mesmo valor que uma sessão aberta antes da migração
+    carregaria — a invalidação só começa no primeiro reset."""
+    import sqlite3
+
+    db_path = tmp_path / "legado_session.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL, role TEXT NOT NULL,
+          must_change_password INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        INSERT INTO users VALUES
+          (1,'Admin','admin@x.org','','h','s','admin',0,'2026-01-01');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database_url = f"sqlite:///{db_path}"
+    create_schema(get_engine(database_url))  # dispara a migração
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, "admin@x.org")
+        assert admin["session_version"] == 0
+        assert _session_is_current(connection, app._session_user_view(admin)) is True
+
+
+def test_reset_e_liberacao_do_bloqueio_sao_commitados_juntos(tmp_path):
+    """Reset, liberação do rate limit e auditoria fecham na mesma transação —
+    e ficam visíveis em uma conexão nova, não só na que executou."""
+    database_url = f"sqlite:///{tmp_path}/reset_commit.db"
+    create_schema(get_engine(database_url))
+
+    with get_connection(database_url) as connection:
+        create_user(connection, "Admin Um", "admin1@teste.org", "", "SenhaAdmin1", "admin")
+        create_user(connection, "Maria", "maria@teste.org", "", "senhaAntiga1", "leitor")
+        connection.commit()
+        admin = get_user_by_email(connection, "admin1@teste.org")
+        maria = get_user_by_email(connection, "maria@teste.org")
+        for _ in range(MAX_LOGIN_ATTEMPTS):
+            _register_failed_login(connection, "maria@teste.org")
+        temporaria = admin_reset_password(connection, admin, maria["id"])
+
+    with get_connection(database_url) as outra:
+        assert _login_locked_until(outra, "maria@teste.org") is None
+        assert authenticate(outra, "maria@teste.org", temporaria) is not None
+        assert authenticate(outra, "maria@teste.org", "senhaAntiga1") is None
+        assert len(list_admin_audit(outra)) == 1
+
+
+def test_login_bem_sucedido_limpa_o_bloqueio_de_forma_duravel(tmp_path, monkeypatch):
+    """A limpeza do contador acontece na tela de login e precisa ser commitada
+    antes do rerun — senão o bloqueio voltaria na conexão seguinte."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/login_commit.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    create_schema(get_engine(database_url))
+    with get_connection(database_url) as connection:
+        create_user(connection, "Maria", "maria@teste.org", "", "senhaCerta12", "leitor")
+        connection.commit()
+        for _ in range(MAX_LOGIN_ATTEMPTS - 1):  # ainda sem bloquear
+            _register_failed_login(connection, "maria@teste.org")
+
+    at = AppTest.from_file("app.py")
+    at.run()
+    at.text_input(key="login_email").input("maria@teste.org")
+    at.text_input(key="login_password").input("senhaCerta12")
+    at.button(key="FormSubmitter:login_form-Entrar").click().run()
+    assert not at.exception, at.exception
+    assert at.radio  # entrou
+
+    with get_connection(database_url) as outra:
+        restantes = outra.execute(
+            text("SELECT COUNT(*) AS n FROM login_attempts WHERE email = 'maria@teste.org'")
+        ).mappings().first()["n"]
+        assert restantes == 0
