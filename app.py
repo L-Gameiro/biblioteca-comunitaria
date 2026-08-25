@@ -9,11 +9,12 @@ Como rodar:
     cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # preencha DATABASE_URL
     streamlit run app.py
 
-Um administrador padrão é criado automaticamente na 1ª execução (e sempre
-que o banco fica sem nenhum admin), já obrigado a trocar a senha no primeiro
-login. As credenciais iniciais estão em _ensure_initialized, único lugar do
-projeto onde elas aparecem — não são repetidas aqui nem no README, que é
-público.
+Um administrador é criado automaticamente na 1ª execução (e sempre que o
+banco fica sem nenhum admin), já obrigado a trocar a senha no primeiro login.
+As credenciais iniciais vêm dos Secrets (BOOTSTRAP_ADMIN_EMAIL e
+BOOTSTRAP_ADMIN_PASSWORD) — nunca de um literal no código, porque este
+repositório é público. Sem elas configuradas o app exibe a instrução e para,
+em vez de criar um admin com senha conhecida.
 
 Recuperação de senha é presencial: um admin redefine a senha pela tela
 "Gestão de Usuários" e entrega a senha temporária ao usuário. Não há fluxo
@@ -362,6 +363,53 @@ def create_schema(engine: Engine) -> None:
     _migrate_add_users_session_version(engine)
 
 
+BOOTSTRAP_ADMIN_EMAIL_KEY = "BOOTSTRAP_ADMIN_EMAIL"
+BOOTSTRAP_ADMIN_PASSWORD_KEY = "BOOTSTRAP_ADMIN_PASSWORD"
+
+def bootstrap_not_configured_message() -> str:
+    """Instrução exibida quando não há admin e nem credenciais iniciais.
+
+    É função, e não constante, porque interpola MIN_PASSWORD_LENGTH — definido
+    mais adiante, na seção de senhas. Em tempo de import ele ainda não existe.
+    """
+    return (
+        "**O banco não tem nenhum administrador e as credenciais iniciais não estão "
+        "configuradas.**\n\n"
+        f"Configure `{BOOTSTRAP_ADMIN_EMAIL_KEY}` e `{BOOTSTRAP_ADMIN_PASSWORD_KEY}` nos "
+        "Secrets do app (no Streamlit Community Cloud: *Settings → Secrets*; localmente: "
+        "`.streamlit/secrets.toml`) e recarregue a página. A senha precisa ter pelo menos "
+        f"{MIN_PASSWORD_LENGTH} caracteres.\n\n"
+        "O administrador será criado com essas credenciais e obrigado a trocar a senha no "
+        "primeiro login."
+    )
+
+
+class BootstrapAdminNotConfigured(RuntimeError):
+    """Não há admin no banco e não há credenciais iniciais configuradas.
+
+    Deliberadamente NÃO existe uma senha padrão de fallback: este repositório é
+    público, então qualquer literal no código seria uma credencial publicada.
+    Um app que sobe sem admin é recuperável — basta configurar o segredo e
+    recarregar. Um admin com senha conhecida por qualquer pessoa, não.
+    """
+
+
+def _get_bootstrap_admin_credentials() -> tuple[str, str] | None:
+    """Credenciais iniciais do admin vindas dos Secrets, ou None se não
+    estiverem configuradas (ausentes, vazias ou com senha fraca demais)."""
+    try:
+        email = st.secrets[BOOTSTRAP_ADMIN_EMAIL_KEY]
+        password = st.secrets[BOOTSTRAP_ADMIN_PASSWORD_KEY]
+    except Exception:
+        return None
+
+    email = (email or "").strip().lower()
+    password = password or ""
+    if not email or password_strength_error(password):
+        return None
+    return email, password
+
+
 @st.cache_resource(show_spinner=False)
 def _ensure_initialized(database_url: str) -> bool:
     """Prepara o banco uma única vez por processo.
@@ -388,17 +436,20 @@ def _ensure_initialized(database_url: str) -> bool:
         # SQL manual) precisa recriar o acesso, senão fica irrecuperável pela
         # aplicação.
         #
-        # As credenciais iniciais abaixo são a ÚNICA cópia delas no projeto: o
-        # README (público) manda consultar este ponto do código em vez de
-        # repeti-las. A conta nasce com must_change_password, mas isso só é
-        # cobrado no primeiro login — quem faz o deploy deve logar e trocar a
-        # senha como parte do procedimento, não depois.
+        # As credenciais iniciais vêm dos Secrets, NUNCA de um literal: este
+        # repositório é público, e uma senha no código é uma senha publicada.
+        # Sem elas configuradas, não criamos admin nenhum — ver
+        # BootstrapAdminNotConfigured.
         admin_count = conn.execute(
             text("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
         ).mappings().first()["n"]
         if admin_count == 0:
+            credentials = _get_bootstrap_admin_credentials()
+            if credentials is None:
+                raise BootstrapAdminNotConfigured(bootstrap_not_configured_message())
+            email, password = credentials
             create_user(
-                conn, "Administrador", "admin@biblioteca.org", "", "admin123", "admin",
+                conn, "Administrador", email, "", password, "admin",
                 must_change_password=True,
             )
             conn.commit()
@@ -1041,6 +1092,45 @@ def loan_summary_for_books(conn, book_ids) -> dict:
     return summary
 
 
+def update_book(conn, book_id, title, author, category, status) -> None:
+    """Atualiza um livro, preservando o invariante livro↔empréstimo.
+
+    Um livro com empréstimo ATIVO não pode passar a 'Disponível' nem a
+    'Em Manutenção': ele está fisicamente com alguém, e liberá-lo no catálogo
+    permitiria um segundo empréstimo do mesmo exemplar — dois leitores
+    registrados com o mesmo livro, sem nenhuma tela sinalizando.
+
+    A checagem é feita DENTRO da transação, com a linha do livro travada, e não
+    com o que a tela carregou: entre abrir o formulário e clicar em salvar, o
+    livro pode ter sido emprestado por outra sessão.
+    """
+    book = conn.execute(
+        select(books_table).where(books_table.c.id == book_id).with_for_update()
+    ).mappings().first()
+    if book is None:
+        raise ValueError("Livro não encontrado — ele pode ter sido removido.")
+
+    if status != "Emprestado" and get_active_loan_for_book(conn, book_id) is not None:
+        raise ValueError(
+            f"Este livro tem um empréstimo ativo e não pode ficar como '{status}'. "
+            "Registre a devolução em Empréstimos antes de mudar o status."
+        )
+
+    conn.execute(
+        text(
+            "UPDATE books SET title = :title, author = :author, "
+            "category = :category, status = :status WHERE id = :id"
+        ),
+        {
+            "title": title,
+            "author": author,
+            "category": category,
+            "status": status,
+            "id": book_id,
+        },
+    )
+
+
 def delete_book(conn, book_id) -> None:
     """Remove um livro e todo o seu histórico de empréstimos (já devolvidos),
     de forma atômica: as duas exclusões acontecem na mesma transação e só
@@ -1048,12 +1138,25 @@ def delete_book(conn, book_id) -> None:
 
     Levanta ValueError se houver empréstimo ATIVO para o livro — controle do
     exemplar físico em posse de alguém, que precisa ser devolvido antes.
+
+    Trava a linha do livro antes de checar, para que um empréstimo criado entre
+    a checagem e o DELETE não seja apagado junto. E apaga apenas os empréstimos
+    já DEVOLVIDOS: se um ativo aparecer mesmo assim, a FK de loans.book_id
+    impede a remoção do livro em vez de o histórico sumir em silêncio.
     """
+    book = conn.execute(
+        select(books_table).where(books_table.c.id == book_id).with_for_update()
+    ).mappings().first()
+    if book is None:
+        raise ValueError("Livro não encontrado — ele pode ter sido removido.")
     if get_active_loan_for_book(conn, book_id) is not None:
         raise ValueError(
             "Este livro está emprestado no momento. Registre a devolução antes de removê-lo."
         )
-    conn.execute(text("DELETE FROM loans WHERE book_id = :book_id"), {"book_id": book_id})
+    conn.execute(
+        text("DELETE FROM loans WHERE book_id = :book_id AND status = 'devolvido'"),
+        {"book_id": book_id},
+    )
     conn.execute(text("DELETE FROM books WHERE id = :id"), {"id": book_id})
 
 
@@ -1507,14 +1610,28 @@ def is_overdue(due_date, status: str = "ativo", reference_date=None) -> bool:
 
 def request_loan(conn, book_id, user_id, due_date=None):
     """Registra um empréstimo. Sem due_date explícito, aplica o prazo padrão;
-    com due_date, respeita o prazo ajustado no momento do registro."""
-    book = conn.execute(
-        text("SELECT * FROM books WHERE id = :id"), {"id": book_id}
-    ).mappings().first()
-    if book is None or book["status"] != "Disponível":
-        raise ValueError("Livro indisponível para empréstimo.")
+    com due_date, respeita o prazo ajustado no momento do registro.
+
+    A disponibilidade é decidida pelo PRÓPRIO UPDATE condicional, não por um
+    SELECT anterior: ler o status e depois gravar deixa uma janela em que duas
+    sessões leem 'Disponível' e ambas criam empréstimo do mesmo exemplar. O
+    UPDATE trava a linha; em READ COMMITTED (padrão do Supabase) a segunda
+    sessão espera, reavalia o WHERE e não afeta nenhuma linha.
+    """
     now = datetime.now().isoformat(timespec="seconds")
     due = _to_date(due_date) or default_due_date(now)
+
+    claimed = conn.execute(
+        text(
+            "UPDATE books SET status = 'Emprestado' "
+            "WHERE id = :id AND status = 'Disponível'"
+        ),
+        {"id": book_id},
+    )
+    if claimed.rowcount != 1:
+        # livro inexistente, em manutenção ou já emprestado por outra sessão
+        raise ValueError("Livro indisponível para empréstimo.")
+
     conn.execute(
         text(
             "INSERT INTO loans (book_id, user_id, loan_date, due_date, status) "
@@ -1528,22 +1645,27 @@ def request_loan(conn, book_id, user_id, due_date=None):
             "status": "ativo",
         },
     )
-    conn.execute(
-        text("UPDATE books SET status = 'Emprestado' WHERE id = :id"), {"id": book_id}
-    )
 
 
 def return_loan(conn, loan_id):
+    """Registra a devolução. Trava a linha do empréstimo antes de decidir, para
+    que duas sessões clicando "Registrar devolução" ao mesmo tempo não gravem
+    a devolução duas vezes (a segunda espera a trava e vê 'devolvido')."""
     loan = conn.execute(
-        text("SELECT * FROM loans WHERE id = :id"), {"id": loan_id}
+        select(loans_table).where(loans_table.c.id == loan_id).with_for_update()
     ).mappings().first()
     if loan is None or loan["status"] != "ativo":
         raise ValueError("Empréstimo não está ativo.")
     now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        text("UPDATE loans SET status = 'devolvido', return_date = :return_date WHERE id = :id"),
+    settled = conn.execute(
+        text(
+            "UPDATE loans SET status = 'devolvido', return_date = :return_date "
+            "WHERE id = :id AND status = 'ativo'"
+        ),
         {"return_date": now, "id": loan_id},
     )
+    if settled.rowcount != 1:
+        raise ValueError("Empréstimo não está ativo.")
     conn.execute(
         text("UPDATE books SET status = 'Disponível' WHERE id = :id"), {"id": loan["book_id"]}
     )
@@ -1751,10 +1873,18 @@ def show_catalog(conn, user):
                             key=f"borrow_{r['id']}",
                             width="stretch",
                         ):
-                            request_loan(conn, r["id"], user["id"], due_date=due)
-                            conn.commit()
-                            st.success(f'Empréstimo de "{r["title"]}" registrado!')
-                            st.rerun()
+                            try:
+                                request_loan(conn, r["id"], user["id"], due_date=due)
+                                conn.commit()
+                            except (ValueError, IntegrityError) as exc:
+                                conn.rollback()
+                                st.error(
+                                    f"Não foi possível registrar o empréstimo: {exc} "
+                                    "Atualize a página para ver a situação atual do livro."
+                                )
+                            else:
+                                st.success(f'Empréstimo de "{r["title"]}" registrado!')
+                                st.rerun()
 
 
 def show_book_management(conn):
@@ -1775,11 +1905,20 @@ def show_book_management(conn):
                 if not title or not author:
                     st.error("Título e autor são obrigatórios.")
                 else:
-                    code = add_book(conn, title, author, category)
-                    conn.commit()
-                    st.success(
-                        f'Livro cadastrado no acervo **{category}** com código **{code}**'
-                    )
+                    try:
+                        code = add_book(conn, title, author, category)
+                        conn.commit()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(
+                            "Não foi possível cadastrar o livro. Se o código gerado já "
+                            "existir no acervo, cadastre informando um código manualmente "
+                            f"pela importação de CSV. Detalhe: {exc}"
+                        )
+                    else:
+                        st.success(
+                            f'Livro cadastrado no acervo **{category}** com código **{code}**'
+                        )
 
     st.subheader("Livros cadastrados")
     statuses = BOOK_STATUSES
@@ -1810,22 +1949,15 @@ def show_book_management(conn):
                     key=f"s_{r['id']}",
                 )
                 if st.form_submit_button("Salvar alterações"):
-                    conn.execute(
-                        text(
-                            "UPDATE books SET title = :title, author = :author, "
-                            "category = :category, status = :status WHERE id = :id"
-                        ),
-                        {
-                            "title": title,
-                            "author": author,
-                            "category": category,
-                            "status": status,
-                            "id": r["id"],
-                        },
-                    )
-                    conn.commit()
-                    st.success("Livro atualizado.")
-                    st.rerun()
+                    try:
+                        update_book(conn, r["id"], title, author, category, status)
+                        conn.commit()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(f"Não foi possível salvar as alterações: {exc}")
+                    else:
+                        st.success("Livro atualizado.")
+                        st.rerun()
 
             st.markdown("---")
             summary = loan_summary.get(r["id"], {"total": 0, "ativos": 0})
@@ -1873,15 +2005,19 @@ def show_book_management(conn):
 # (vieram assim da carga inicial, com o nome de quem pegou só na planilha)
 # ---------------------------------------------------------------------------
 
-def _unreconciled_where(query: str = ""):
-    """Livro com status 'Emprestado' e sem NENHUM empréstimo ativo na base."""
-    active_loan_exists = (
+def _active_loan_exists():
+    """Subconsulta: este livro tem algum empréstimo ativo?"""
+    return (
         select(loans_table.c.id)
         .where(loans_table.c.book_id == books_table.c.id)
         .where(loans_table.c.status == "ativo")
         .exists()
     )
-    clauses = [books_table.c.status == "Emprestado", ~active_loan_exists]
+
+
+def _unreconciled_where(query: str = ""):
+    """Livro com status 'Emprestado' e sem NENHUM empréstimo ativo na base."""
+    clauses = [books_table.c.status == "Emprestado", ~_active_loan_exists()]
 
     term = normalize_search_term(query)
     if term:
@@ -1913,6 +2049,44 @@ def list_unreconciled_books(
         stmt = stmt.where(clause)
     stmt = stmt.order_by(books_table.c.title).limit(limit).offset(offset)
     return conn.execute(stmt).mappings().all()
+
+
+def count_books_loaned_but_available(conn) -> int:
+    """Sentido INVERSO da reconciliação: livro que NÃO está 'Emprestado' mas
+    tem empréstimo ativo.
+
+    Depois da validação em update_book e das travas em request_loan/return_loan,
+    a aplicação não consegue mais produzir esse estado — mas SQL manual, uma
+    restauração de backup ou uma carga direta no Supabase conseguem. É uma
+    rede de segurança: sem detecção, o exemplar volta ao catálogo e pode ser
+    emprestado a um segundo leitor sem que nenhuma tela avise.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(books_table)
+        .where(books_table.c.status != "Emprestado")
+        .where(_active_loan_exists())
+    )
+    return conn.execute(stmt).scalar_one()
+
+
+def list_books_loaned_but_available(conn, limit: int = PAGE_SIZE):
+    """Os livros do sentido inverso, com quem consta como estando com eles."""
+    return conn.execute(
+        text(
+            """
+            SELECT books.code, books.title, books.status,
+                   users.full_name, loans.loan_date
+            FROM books
+            JOIN loans ON loans.book_id = books.id AND loans.status = 'ativo'
+            JOIN users ON users.id = loans.user_id
+            WHERE books.status <> 'Emprestado'
+            ORDER BY books.title
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    ).mappings().all()
 
 
 def _lock_unreconciled_book(conn, book_id):
@@ -2210,10 +2384,18 @@ def show_loan_management(conn):
                 if st.button(
                     "✅ Registrar devolução", key=f"return_{r['loan_id']}", width="stretch"
                 ):
-                    return_loan(conn, r["loan_id"])
-                    conn.commit()
-                    st.success("Devolução registrada.")
-                    st.rerun()
+                    try:
+                        return_loan(conn, r["loan_id"])
+                        conn.commit()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(
+                            f"Não foi possível registrar a devolução: {exc} "
+                            "Atualize a página para ver a lista atualizada."
+                        )
+                    else:
+                        st.success("Devolução registrada.")
+                        st.rerun()
 
 
 def show_admin_loan_history(conn):
@@ -2347,10 +2529,18 @@ def show_my_loans(conn, user):
                 if st.button(
                     "Solicitar devolução", key=f"selfreturn_{r['loan_id']}", width="stretch"
                 ):
-                    return_loan(conn, r["loan_id"])
-                    conn.commit()
-                    st.success("Devolução registrada. Obrigado!")
-                    st.rerun()
+                    try:
+                        return_loan(conn, r["loan_id"])
+                        conn.commit()
+                    except (ValueError, IntegrityError) as exc:
+                        conn.rollback()
+                        st.error(
+                            f"Não foi possível registrar a devolução: {exc} "
+                            "Atualize a página — ela pode já ter sido registrada no balcão."
+                        )
+                    else:
+                        st.success("Devolução registrada. Obrigado!")
+                        st.rerun()
 
     st.subheader("Histórico completo")
     history = conn.execute(
@@ -2603,6 +2793,36 @@ def show_user_management(conn, current_user):
             st.caption("Nenhuma redefinição de senha registrada até agora.")
 
 
+def _show_loaned_but_available_warning(conn) -> None:
+    """Alerta do sentido inverso: livro liberado no catálogo com empréstimo
+    ativo. Só detecta e orienta — a correção é registrar a devolução em
+    Empréstimos, que fecha o empréstimo e o status de uma vez só."""
+    total = count_books_loaned_but_available(conn)
+    if not total:
+        return
+
+    st.error(
+        f"⚠️ **{total} livro(s) com empréstimo ativo, mas fora do status "
+        "'Emprestado'.** Nesse estado o mesmo exemplar pode ser emprestado a um "
+        "segundo leitor. Registre a devolução em **Empréstimos** (isso fecha o "
+        "empréstimo e libera o livro juntos) ou volte o status para *Emprestado* "
+        "em **Gestão de Livros**."
+    )
+    st.dataframe(
+        [
+            {
+                "Livro": f"{r['title']} ({r['code']})",
+                "Status atual": r["status"],
+                "Consta com": r["full_name"],
+                "Desde": r["loan_date"],
+            }
+            for r in list_books_loaned_but_available(conn)
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+
+
 def show_loan_reconciliation(conn):
     st.header("Reconciliação de empréstimos")
     st.caption(
@@ -2623,6 +2843,8 @@ def show_loan_reconciliation(conn):
     total = count_unreconciled_books(conn, query)
     total_geral = count_unreconciled_books(conn)
     st.metric("Pendentes de reconciliação", total_geral)
+
+    _show_loaned_but_available_warning(conn)
 
     if not total:
         st.success(
@@ -2822,12 +3044,23 @@ def show_csv_import(conn):
         st.dataframe(error_rows, width="stretch")
 
     if st.button("Confirmar importação", disabled=bool(error_rows)):
-        count = commit_import(conn, processed)
-        conn.commit()
-        st.success(f"{count} livro(s) importado(s) com sucesso.")
-        for key in ("csv_import_rows", "csv_import_signature"):
-            st.session_state.pop(key, None)
-        st.rerun()
+        try:
+            count = commit_import(conn, processed)
+            conn.commit()
+        except (ValueError, IntegrityError) as exc:
+            conn.rollback()
+            st.error(
+                "Não foi possível concluir a importação e **nenhum livro foi gravado** "
+                "(a importação inteira é uma transação só). Isso costuma acontecer "
+                "quando um código já foi cadastrado por outra pessoa depois que esta "
+                f"pré-visualização foi gerada. Reenvie o arquivo para recalcular. "
+                f"Detalhe: {exc}"
+            )
+        else:
+            st.success(f"{count} livro(s) importado(s) com sucesso.")
+            for key in ("csv_import_rows", "csv_import_signature"):
+                st.session_state.pop(key, None)
+            st.rerun()
 
 
 def show_app(conn):
@@ -2932,7 +3165,13 @@ def main():
         icon_image="assets/logo_pequeno_cce.png",
     )
     _inject_card_border_css()
-    init_db()
+    try:
+        init_db()
+    except BootstrapAdminNotConfigured as exc:
+        # Estado de configuração, não erro de execução: mostra o que fazer e
+        # para aqui, em vez de seguir para uma tela de login sem nenhuma conta.
+        st.error(str(exc))
+        st.stop()
 
     if "user" not in st.session_state:
         st.session_state.user = None

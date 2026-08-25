@@ -4,3 +4,12 @@ backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F2F2F2"
 textColor = "#262626"
 font = "sans serif"
+
+[client]
+# Nenhum detalhe de exceção no navegador: o padrão do Streamlit é "full", que
+# renderiza o traceback completo — com SQL, parâmetros e caminhos do servidor
+# — para qualquer visitante, inclusive anônimo na tela de login. Os erros
+# previstos já são tratados e exibidos com st.error; o que sobrar aqui é bug,
+# e o traceback fica nos logs do servidor, onde deve ficar.
+# Valores possíveis: "full", "stacktrace", "type", "none".
+showErrorDetails = "none"

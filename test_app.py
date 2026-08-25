@@ -13,6 +13,7 @@ Os testes usam SQLite local descartável através da mesma camada SQLAlchemy
 usada em produção (Postgres/Supabase) — não dependem de acesso de rede.
 """
 
+import contextlib
 import csv
 import io
 from datetime import date, datetime, timedelta
@@ -93,6 +94,29 @@ from app import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+# Credenciais de bootstrap usadas pelos testes. Injetadas via st.secrets em
+# cada teste que inicializa um banco — o app não tem mais literal nenhum, e
+# a suíte não pode reintroduzir um por dependência implícita.
+BOOTSTRAP_EMAIL = "admin.teste@biblioteca.org"
+BOOTSTRAP_PASSWORD = "SenhaBootstrap#2026"
+
+
+def _secrets(**extra) -> dict:
+    """Secrets com as credenciais de bootstrap, mais o que o teste precisar."""
+    return {
+        "BOOTSTRAP_ADMIN_EMAIL": BOOTSTRAP_EMAIL,
+        "BOOTSTRAP_ADMIN_PASSWORD": BOOTSTRAP_PASSWORD,
+        **extra,
+    }
+
+
+@pytest.fixture
+def bootstrap_secrets(monkeypatch):
+    """Deixa as credenciais iniciais configuradas para este teste."""
+    monkeypatch.setattr(app.st, "secrets", _secrets())
+    return BOOTSTRAP_EMAIL, BOOTSTRAP_PASSWORD
+
 
 @pytest.fixture
 def conn(tmp_path):
@@ -355,12 +379,12 @@ def _login_as_admin_and_complete_forced_password_change(at, new_password="NovaSe
     """Login com a senha padrão do bootstrap (must_change_password=True) e
     conclui a troca obrigatória, deixando o AppTest pronto para navegar nas
     telas normais do admin."""
-    at.text_input(key="login_email").input("admin@biblioteca.org")
-    at.text_input(key="login_password").input("admin123")
+    at.text_input(key="login_email").input(BOOTSTRAP_EMAIL)
+    at.text_input(key="login_password").input(BOOTSTRAP_PASSWORD)
     at.button(key="FormSubmitter:login_form-Entrar").click().run()
     assert not at.exception, at.exception
 
-    at.text_input(key="cp_current").input("admin123")
+    at.text_input(key="cp_current").input(BOOTSTRAP_PASSWORD)
     at.text_input(key="cp_new").input(new_password)
     at.text_input(key="cp_confirm").input(new_password)
     at.button(key="FormSubmitter:change_password_form-Salvar nova senha").click().run()
@@ -395,7 +419,7 @@ def test_integracao_tela_importacao_mostra_12_colunas(tmp_path, monkeypatch):
             return data
 
     database_url = f"sqlite:///{tmp_path}/integ_import.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
     monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
 
     at = AppTest.from_file("app.py")
@@ -452,7 +476,7 @@ def test_reenviar_arquivo_com_mesmo_nome_e_conteudo_diferente_reprocessa(tmp_pat
             return state["data"]
 
     database_url = f"sqlite:///{tmp_path}/integ_reupload.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
     monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
 
     at = AppTest.from_file("app.py")
@@ -590,7 +614,7 @@ def test_resumo_estatistico_mistura_mantidos_gerados_e_erros(conn):
 # Camada de banco (SQLAlchemy) — init_db, engine/conexão, empréstimos
 # ---------------------------------------------------------------------------
 
-def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
+def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path, bootstrap_secrets):
     database_url = f"sqlite:///{tmp_path}/init.db"
     init_db(database_url)
     # limpar o cache entre as chamadas garante que a inicializacao roda MESMO
@@ -600,10 +624,10 @@ def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
     init_db(database_url)  # 2a execucao real, como num restart do Streamlit Cloud
 
     with get_connection(database_url) as connection:
-        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
         assert admin is not None
         assert admin["role"] == "admin"
-        assert verify_password("admin123", admin["password_hash"], admin["salt"])
+        assert verify_password(BOOTSTRAP_PASSWORD, admin["password_hash"], admin["salt"])
         assert admin["password_hash"].startswith("$2")  # bcrypt, não sha256
         assert bool(admin["must_change_password"]) is True  # força troca no 1º login
 
@@ -611,7 +635,7 @@ def test_init_db_cria_schema_e_admin_de_forma_idempotente(tmp_path):
         assert user_count == 1  # não duplicou o admin na 2ª chamada
 
 
-def test_init_db_recria_admin_quando_ha_leitores_mas_nenhum_admin(tmp_path):
+def test_init_db_recria_admin_quando_ha_leitores_mas_nenhum_admin(tmp_path, bootstrap_secrets):
     """Estado inconsistente (anonimização, migração, SQL manual) pode deixar
     o banco com leitores cadastrados e nenhum admin — sem recriação, o acesso
     fica irrecuperável pela aplicação."""
@@ -627,7 +651,7 @@ def test_init_db_recria_admin_quando_ha_leitores_mas_nenhum_admin(tmp_path):
     init_db(database_url)  # simula o restart que deve recuperar o acesso
 
     with get_connection(database_url) as connection:
-        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
         assert admin is not None
         assert admin["role"] == "admin"
 
@@ -638,7 +662,7 @@ def test_init_db_recria_admin_quando_ha_leitores_mas_nenhum_admin(tmp_path):
         assert counts == {"admin": 1, "leitor": 1}
 
 
-def test_init_db_com_admin_existente_nao_recria_nem_duplica(tmp_path):
+def test_init_db_com_admin_existente_nao_recria_nem_duplica(tmp_path, bootstrap_secrets):
     database_url = f"sqlite:///{tmp_path}/com_admin.db"
     init_db(database_url)
 
@@ -658,11 +682,11 @@ def test_init_db_com_admin_existente_nao_recria_nem_duplica(tmp_path):
         ).mappings().first()["n"]
         assert admin_count == 2  # nenhum admin novo foi criado
 
-        default_admin = get_user_by_email(connection, "admin@biblioteca.org")
+        default_admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
         assert bool(default_admin["must_change_password"]) is False  # não foi recriado/sobrescrito
 
 
-def test_admin_recriado_apos_perda_nasce_exigindo_troca_de_senha(tmp_path):
+def test_admin_recriado_apos_perda_nasce_exigindo_troca_de_senha(tmp_path, bootstrap_secrets):
     database_url = f"sqlite:///{tmp_path}/recriado_forca_troca.db"
     init_db(database_url)
 
@@ -674,11 +698,11 @@ def test_admin_recriado_apos_perda_nasce_exigindo_troca_de_senha(tmp_path):
     init_db(database_url)
 
     with get_connection(database_url) as connection:
-        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
         assert bool(admin["must_change_password"]) is True
 
 
-def test_init_db_nao_insere_livros_de_exemplo(tmp_path):
+def test_init_db_nao_insere_livros_de_exemplo(tmp_path, bootstrap_secrets):
     """O catálogo começa vazio: os livros vêm da carga real do acervo, e um
     seed automático colidiria com códigos reais do cliente (ASSM-001 etc.)."""
     database_url = f"sqlite:///{tmp_path}/init_sem_seed.db"
@@ -691,7 +715,7 @@ def test_init_db_nao_insere_livros_de_exemplo(tmp_path):
         assert book_count == 0
 
 
-def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path):
+def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path, bootstrap_secrets):
     """Reiniciar o app (init_db de novo, com engine novo) não pode repor
     livros — nem os de exemplo, nem repetir a carga real já existente."""
     database_url = f"sqlite:///{tmp_path}/init_reinicio.db"
@@ -713,6 +737,99 @@ def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path):
         assert rows[0]["code"] == "ASSM-001"  # código real do cliente preservado
 
 
+# --- credenciais iniciais vindas dos Secrets (achado 1) --------------------
+
+def test_bootstrap_sem_segredos_nao_cria_admin_e_explica_o_que_configurar(
+    tmp_path, monkeypatch
+):
+    """Sem credenciais configuradas o app NÃO inventa uma senha padrão: um app
+    sem admin é recuperável, um admin com senha pública não é."""
+    monkeypatch.setattr(app.st, "secrets", {})
+    database_url = f"sqlite:///{tmp_path}/sem_segredos.db"
+    app._ensure_initialized.clear()
+
+    with pytest.raises(app.BootstrapAdminNotConfigured) as exc:
+        init_db(database_url)
+
+    mensagem = str(exc.value)
+    assert "BOOTSTRAP_ADMIN_EMAIL" in mensagem
+    assert "BOOTSTRAP_ADMIN_PASSWORD" in mensagem
+
+    # o schema foi criado, mas nenhuma conta nasceu
+    with get_connection(database_url) as connection:
+        total = connection.execute(text("SELECT COUNT(*) AS n FROM users")).mappings().first()["n"]
+        assert total == 0
+
+
+@pytest.mark.parametrize(
+    "secrets_incompletos",
+    [
+        {},
+        {"BOOTSTRAP_ADMIN_EMAIL": BOOTSTRAP_EMAIL},                # falta a senha
+        {"BOOTSTRAP_ADMIN_PASSWORD": BOOTSTRAP_PASSWORD},          # falta o e-mail
+        {"BOOTSTRAP_ADMIN_EMAIL": "", "BOOTSTRAP_ADMIN_PASSWORD": BOOTSTRAP_PASSWORD},
+        {"BOOTSTRAP_ADMIN_EMAIL": BOOTSTRAP_EMAIL, "BOOTSTRAP_ADMIN_PASSWORD": ""},
+        {"BOOTSTRAP_ADMIN_EMAIL": BOOTSTRAP_EMAIL, "BOOTSTRAP_ADMIN_PASSWORD": "curta"},
+    ],
+)
+def test_bootstrap_recusa_configuracao_incompleta_ou_senha_fraca(
+    tmp_path, monkeypatch, secrets_incompletos
+):
+    monkeypatch.setattr(app.st, "secrets", secrets_incompletos)
+    app._ensure_initialized.clear()
+
+    with pytest.raises(app.BootstrapAdminNotConfigured):
+        init_db(f"sqlite:///{tmp_path}/incompleto.db")
+
+
+def test_bootstrap_com_segredos_cria_o_admin_com_essas_credenciais(
+    tmp_path, bootstrap_secrets
+):
+    email, senha = bootstrap_secrets
+    database_url = f"sqlite:///{tmp_path}/com_segredos.db"
+    app._ensure_initialized.clear()
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        admin = get_user_by_email(connection, email)
+        assert admin is not None
+        assert admin["role"] == "admin"
+        assert verify_password(senha, admin["password_hash"], admin["salt"])
+        assert bool(admin["must_change_password"]) is True
+
+
+def test_bootstrap_usa_o_email_dos_segredos_e_nao_um_padrao(tmp_path, monkeypatch):
+    """Nenhum e-mail literal sobrou: quem manda é o segredo."""
+    monkeypatch.setattr(
+        app.st,
+        "secrets",
+        {"BOOTSTRAP_ADMIN_EMAIL": "OutroAdmin@CCE.org", "BOOTSTRAP_ADMIN_PASSWORD": "OutraSenha#123"},
+    )
+    database_url = f"sqlite:///{tmp_path}/email_proprio.db"
+    app._ensure_initialized.clear()
+    init_db(database_url)
+
+    with get_connection(database_url) as connection:
+        assert get_user_by_email(connection, "outroadmin@cce.org") is not None  # normalizado
+        assert get_user_by_email(connection, "admin@biblioteca.org") is None
+
+
+def test_tela_sem_segredos_mostra_instrucao_e_nao_abre_o_login(tmp_path, monkeypatch):
+    """Ponta a ponta: o app para na instrução, sem tela de login utilizável."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/tela_sem_segredos.db"
+    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    app._ensure_initialized.clear()
+
+    at = AppTest.from_file("app.py")
+    at.run()
+
+    assert not at.exception, at.exception
+    assert any("BOOTSTRAP_ADMIN_EMAIL" in e.value for e in at.error)
+    assert not at.text_input  # nem o formulário de login foi renderizado
+
+
 def test_get_connection_sem_database_url_levanta_erro_claro(monkeypatch):
     monkeypatch.setattr(app.st, "secrets", {})
     with pytest.raises(RuntimeError, match="DATABASE_URL"):
@@ -730,12 +847,12 @@ def test_login_admin_bootstrap_fica_bloqueado_ate_trocar_a_senha(tmp_path, monke
     from streamlit.testing.v1 import AppTest
 
     database_url = f"sqlite:///{tmp_path}/forca_troca.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
 
     at = AppTest.from_file("app.py")
     at.run()
-    at.text_input(key="login_email").input("admin@biblioteca.org")
-    at.text_input(key="login_password").input("admin123")
+    at.text_input(key="login_email").input(BOOTSTRAP_EMAIL)
+    at.text_input(key="login_password").input(BOOTSTRAP_PASSWORD)
     at.button(key="FormSubmitter:login_form-Entrar").click().run()
     assert not at.exception, at.exception
 
@@ -743,7 +860,7 @@ def test_login_admin_bootstrap_fica_bloqueado_ate_trocar_a_senha(tmp_path, monke
     assert at.title[0].value == "Alterar minha senha"
     assert not at.radio  # sidebar com "Painel"/"Catálogo"/etc. não aparece
 
-    at.text_input(key="cp_current").input("admin123")
+    at.text_input(key="cp_current").input(BOOTSTRAP_PASSWORD)
     at.text_input(key="cp_new").input("NovaSenh@123")
     at.text_input(key="cp_confirm").input("NovaSenh@123")
     at.button(key="FormSubmitter:change_password_form-Salvar nova senha").click().run()
@@ -753,13 +870,13 @@ def test_login_admin_bootstrap_fica_bloqueado_ate_trocar_a_senha(tmp_path, monke
     assert at.radio  # menu normal liberado
 
     with get_connection(database_url) as connection:
-        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
         assert bool(admin["must_change_password"]) is False
         assert verify_password("NovaSenh@123", admin["password_hash"], admin["salt"])
-        assert not verify_password("admin123", admin["password_hash"], admin["salt"])
+        assert not verify_password(BOOTSTRAP_PASSWORD, admin["password_hash"], admin["salt"])
 
 
-def test_migracao_forca_troca_de_senha_para_admin_ja_existente_em_producao(tmp_path):
+def test_migracao_forca_troca_de_senha_para_admin_ja_existente_em_producao(tmp_path, bootstrap_secrets):
     """Banco criado antes deste recurso: a migração precisa marcar
     must_change_password=1 para contas admin já existentes, porque a única
     senha que elas puderam ter é a padrão do bootstrap, que ficava exposta na
@@ -1443,6 +1560,543 @@ def test_unicidade_continua_bloqueando_duplicatas_nas_duas_estrategias(conn):
 
 
 # ---------------------------------------------------------------------------
+# Caminhos de escrita da UI falham com st.error, nunca com traceback (achado 3)
+# ---------------------------------------------------------------------------
+# Sem tratamento, o Streamlit renderiza o traceback completo (SQL, parâmetros,
+# caminhos do servidor) no navegador de qualquer visitante.
+#
+# As funções show_* são chamadas DIRETAMENTE, fora do runtime do Streamlit:
+# a função de tela, a conexão e o try/except exercitados são os reais — só a
+# camada de widget (qual botão foi clicado, o que foi exibido) é substituída.
+# Não dá para fazer isso com AppTest: ele executa app.py num módulo novo a cada
+# run, então um monkeypatch em app.<função> não alcança a tela, e não há como
+# forçar a falha de dentro.
+
+
+class _SessionStateFake(dict):
+    """session_state não funciona fora do `streamlit run`; este substituto
+    cobre o que as telas usam (atributo, get, pop, item)."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+class _Tela:
+    """Captura o que a tela mostraria e decide quais botões foram clicados."""
+
+    def __init__(self, monkeypatch, botoes=(), submits=False, session=None):
+        self.erros: list[str] = []
+        self.sucessos: list[str] = []
+        alvos = set(botoes)
+        # st.form/st.expander guardam estado de formulário no ScriptRunContext,
+        # que não existe fora do `streamlit run`: em bare mode eles não o
+        # restauram e o vazamento derruba os testes de AppTest seguintes com
+        # "Forms cannot be nested in other forms". São contêineres de layout,
+        # irrelevantes para o try/except que está sob teste.
+        monkeypatch.setattr(app.st, "form", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(app.st, "expander", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(app.st, "button", lambda *a, **k: k.get("key") in alvos)
+        monkeypatch.setattr(app.st, "form_submit_button", lambda *a, **k: submits)
+        monkeypatch.setattr(app.st, "error", lambda m, *a, **k: self.erros.append(str(m)))
+        monkeypatch.setattr(app.st, "success", lambda m, *a, **k: self.sucessos.append(str(m)))
+        monkeypatch.setattr(app.st, "warning", lambda *a, **k: None)
+        monkeypatch.setattr(app.st, "rerun", lambda *a, **k: None)
+        monkeypatch.setattr(app.st, "session_state", session or _SessionStateFake())
+
+    @property
+    def texto(self) -> str:
+        return " ".join(self.erros)
+
+
+def _falha_com(monkeypatch, nome, excecao):
+    """Faz a operação de domínio `nome` falhar, para exercitar o wrapper."""
+
+    def _boom(*args, **kwargs):
+        raise excecao
+
+    monkeypatch.setattr(app, nome, _boom)
+
+
+def _integrity_error():
+    """IntegrityError equivalente ao que o UNIQUE(code) produz no Postgres."""
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    return SAIntegrityError(
+        "INSERT INTO books (code, ...) VALUES (...)",
+        {"code": "ASSM-001"},
+        Exception('duplicate key value violates unique constraint "books_code_key"'),
+    )
+
+
+@pytest.fixture
+def cenario_emprestimo(conn):
+    """Um livro emprestado a um leitor, com as views que as telas esperam."""
+    create_user(conn, "Leitor UI", "leitor.ui@teste.org", "", "senha1234", "leitor")
+    code = add_book(conn, "Dom Casmurro", "Machado de Assis", "Literária")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    leitor = get_user_by_email(conn, "leitor.ui@teste.org")
+    user_view = {
+        "id": leitor["id"], "full_name": leitor["full_name"], "email": leitor["email"],
+        "role": "leitor", "must_change_password": False, "session_version": 0,
+    }
+    return conn, book_id, user_view
+
+
+def test_ponto1_catalogo_emprestimo_que_falha_mostra_erro_e_nao_propaga(
+    cenario_emprestimo, monkeypatch
+):
+    conn, book_id, user_view = cenario_emprestimo
+    tela = _Tela(monkeypatch, botoes={f"borrow_{book_id}"})
+    _falha_com(monkeypatch, "request_loan", ValueError("Livro indisponível para empréstimo."))
+
+    app.show_catalog(conn, user_view)  # não levanta
+
+    assert "Não foi possível registrar o empréstimo" in tela.texto
+    assert _loans_count_for(conn, book_id) == 0
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 1  # conexão viva
+
+
+def test_ponto2_cadastro_de_livro_com_codigo_duplicado_mostra_erro(conn, monkeypatch):
+    create_user(conn, "Admin", "admin.ui@teste.org", "", "senha1234", "admin")
+    conn.commit()
+    tela = _Tela(monkeypatch, submits=True)
+    monkeypatch.setattr(app.st, "text_input", lambda *a, **k: "Preenchido")
+    _falha_com(monkeypatch, "add_book", _integrity_error())
+
+    app.show_book_management(conn)  # acervo vazio: só o formulário de cadastro roda
+
+    assert "Não foi possível cadastrar o livro" in tela.texto
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 0
+
+
+def test_ponto3_edicao_de_status_com_emprestimo_ativo_mostra_erro(
+    cenario_emprestimo, monkeypatch
+):
+    """Único dos seis que falha naturalmente, sem injeção: a validação de
+    update_book recusa liberar um livro que está com alguém."""
+    conn, book_id, user_view = cenario_emprestimo
+    request_loan(conn, book_id, user_view["id"])
+    conn.commit()
+
+    tela = _Tela(monkeypatch, submits=True)
+    monkeypatch.setattr(app.st, "text_input", lambda *a, **k: "Dom Casmurro")
+    monkeypatch.setattr(app.st, "selectbox", lambda *a, **k: "Disponível")
+
+    app.show_book_management(conn)
+
+    assert "empréstimo ativo" in tela.texto
+    assert _book_status(conn, book_id) == "Emprestado"
+
+
+def test_ponto4_devolucao_que_falha_em_emprestimos_mostra_erro(
+    cenario_emprestimo, monkeypatch
+):
+    conn, book_id, user_view = cenario_emprestimo
+    request_loan(conn, book_id, user_view["id"])
+    conn.commit()
+    loan_id = get_active_loan_for_book(conn, book_id)["id"]
+
+    tela = _Tela(monkeypatch, botoes={f"return_{loan_id}"})
+    monkeypatch.setattr(app.st, "checkbox", lambda *a, **k: False)
+    _falha_com(monkeypatch, "return_loan", ValueError("Empréstimo não está ativo."))
+
+    app.show_loan_management(conn)
+
+    assert "Não foi possível registrar a devolução" in tela.texto
+    assert get_active_loan_for_book(conn, book_id) is not None  # nada mudou
+
+
+def test_ponto5_devolucao_que_falha_em_meus_emprestimos_mostra_erro(
+    cenario_emprestimo, monkeypatch
+):
+    conn, book_id, user_view = cenario_emprestimo
+    request_loan(conn, book_id, user_view["id"])
+    conn.commit()
+    loan_id = get_active_loan_for_book(conn, book_id)["id"]
+
+    tela = _Tela(monkeypatch, botoes={f"selfreturn_{loan_id}"})
+    _falha_com(monkeypatch, "return_loan", ValueError("Empréstimo não está ativo."))
+
+    app.show_my_loans(conn, user_view)
+
+    assert "Não foi possível registrar a devolução" in tela.texto
+    assert get_active_loan_for_book(conn, book_id) is not None
+
+
+def test_ponto6_importacao_que_falha_na_gravacao_mostra_erro_e_nao_grava_nada(
+    conn, monkeypatch
+):
+    csv_bytes = "titulo,autor,categoria\nDom Casmurro,Machado de Assis,Literária\n".encode("utf-8")
+
+    class FakeUpload:
+        name = "acervo.csv"
+        size = len(csv_bytes)
+
+        def getvalue(self):
+            return csv_bytes
+
+    tela = _Tela(monkeypatch, botoes={None}, session=_SessionStateFake())
+    monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
+    monkeypatch.setattr(app.st, "text_input", lambda *a, **k: "")
+    _falha_com(monkeypatch, "commit_import", _integrity_error())
+
+    app.show_csv_import(conn)
+
+    assert "nenhum livro foi gravado" in tela.texto
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 0
+
+
+def test_config_nao_expoe_stacktrace_no_navegador():
+    """O padrão do Streamlit é "full" — traceback com SQL para qualquer
+    visitante, inclusive anônimo na tela de login."""
+    import tomllib
+
+    with open(".streamlit/config.toml", "rb") as arquivo:
+        config = tomllib.load(arquivo)
+
+    assert config["client"]["showErrorDetails"] == "none"
+
+
+def test_botao_de_emprestimo_some_quando_o_livro_deixa_de_estar_disponivel(
+    cenario_emprestimo, monkeypatch
+):
+    """Primeira linha de defesa, antes do try/except: a tela relê o estado a
+    cada rerun, então a ação nem chega a ser oferecida."""
+    conn, book_id, user_view = cenario_emprestimo
+    conn.execute(text("UPDATE books SET status = 'Em Manutenção' WHERE id = :i"), {"i": book_id})
+    conn.commit()
+
+    oferecidos = []
+    monkeypatch.setattr(app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False)
+    monkeypatch.setattr(app.st, "error", lambda *a, **k: None)
+    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
+
+    app.show_catalog(conn, user_view)
+
+    assert f"borrow_{book_id}" not in oferecidos
+
+
+# ---------------------------------------------------------------------------
+# Invariante livro↔empréstimo na edição de status (achado 2)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def livro_emprestado(conn):
+    """Um livro com empréstimo ativo, pronto para tentativas de edição."""
+    create_user(conn, "Leitor A", "a@teste.org", "", "senha1234", "leitor")
+    code = add_book(conn, "Dom Casmurro", "Machado de Assis", "Literária")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    leitor = get_user_by_email(conn, "a@teste.org")["id"]
+    request_loan(conn, book_id, leitor)
+    conn.commit()
+    return conn, book_id, leitor
+
+
+@pytest.mark.parametrize("status_proibido", ["Disponível", "Em Manutenção"])
+def test_update_book_recusa_liberar_livro_com_emprestimo_ativo(
+    livro_emprestado, status_proibido
+):
+    conn, book_id, _ = livro_emprestado
+
+    with pytest.raises(ValueError, match="empréstimo ativo"):
+        app.update_book(conn, book_id, "Dom Casmurro", "Machado de Assis",
+                        "Literária", status_proibido)
+    conn.rollback()
+
+    assert _book_status(conn, book_id) == "Emprestado"
+
+
+def test_update_book_permite_editar_os_outros_campos_com_emprestimo_ativo(
+    livro_emprestado,
+):
+    """A trava é só sobre o status: corrigir título/autor continua liberado."""
+    conn, book_id, _ = livro_emprestado
+
+    app.update_book(conn, book_id, "Dom Casmurro (rev.)", "Machado de Assis Filho",
+                    "Romance", "Emprestado")
+    conn.commit()
+
+    livro = conn.execute(
+        text("SELECT title, author, category, status FROM books WHERE id = :i"),
+        {"i": book_id},
+    ).mappings().first()
+    assert livro["title"] == "Dom Casmurro (rev.)"
+    assert livro["author"] == "Machado de Assis Filho"
+    assert livro["status"] == "Emprestado"
+
+
+def test_update_book_libera_status_depois_da_devolucao(livro_emprestado):
+    conn, book_id, _ = livro_emprestado
+    return_loan(conn, get_active_loan_for_book(conn, book_id)["id"])
+    conn.commit()
+
+    app.update_book(conn, book_id, "Dom Casmurro", "Machado de Assis",
+                    "Literária", "Em Manutenção")
+    conn.commit()
+    assert _book_status(conn, book_id) == "Em Manutenção"
+
+
+def test_update_book_valida_no_momento_da_escrita_e_nao_com_o_dado_da_tela(conn):
+    """A tela carregou o livro como Disponível; outra sessão emprestou antes do
+    clique em salvar. A validação precisa ver o estado NOVO."""
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senha1234", "leitor")
+    code = add_book(conn, "Livro", "Autor X", "Literária")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+
+    carregado_na_tela = conn.execute(
+        text("SELECT status FROM books WHERE id = :i"), {"i": book_id}
+    ).scalar_one()
+    assert carregado_na_tela == "Disponível"  # o que o formulário exibiu
+
+    request_loan(conn, book_id, get_user_by_email(conn, "leitor@teste.org")["id"])
+    conn.commit()
+
+    with pytest.raises(ValueError, match="empréstimo ativo"):
+        app.update_book(conn, book_id, "Livro", "Autor X", "Literária", carregado_na_tela)
+    conn.rollback()
+
+
+def test_update_book_de_livro_removido_avisa(conn):
+    with pytest.raises(ValueError, match="não encontrado"):
+        app.update_book(conn, 99999, "T", "A", "C", "Disponível")
+    conn.rollback()
+
+
+def test_um_segundo_emprestimo_do_mesmo_exemplar_fica_impossivel(livro_emprestado):
+    """O cenário completo do achado 2: sem o UPDATE manual liberando o livro,
+    o segundo leitor não consegue pegar o mesmo exemplar."""
+    conn, book_id, _ = livro_emprestado
+    create_user(conn, "Leitor B", "b@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+    leitor_b = get_user_by_email(conn, "b@teste.org")["id"]
+
+    with pytest.raises(ValueError, match="empréstimo ativo"):
+        app.update_book(conn, book_id, "Dom Casmurro", "Machado de Assis",
+                        "Literária", "Disponível")
+    conn.rollback()
+
+    with pytest.raises(ValueError, match="indisponível"):
+        request_loan(conn, book_id, leitor_b)
+    conn.rollback()
+
+    ativos = conn.execute(
+        text("SELECT COUNT(*) FROM loans WHERE book_id = :b AND status = 'ativo'"),
+        {"b": book_id},
+    ).scalar_one()
+    assert ativos == 1
+
+
+# --- detecção do sentido inverso -------------------------------------------
+
+def test_deteccao_do_sentido_inverso_livro_liberado_com_emprestimo_ativo(
+    livro_emprestado,
+):
+    """Estado que só SQL manual produz depois das travas — precisa ser visto."""
+    conn, book_id, _ = livro_emprestado
+    assert app.count_books_loaned_but_available(conn) == 0
+
+    # simula a intervenção direta no banco que a aplicação não permite mais
+    conn.execute(text("UPDATE books SET status = 'Disponível' WHERE id = :i"), {"i": book_id})
+    conn.commit()
+
+    assert app.count_books_loaned_but_available(conn) == 1
+    detectados = app.list_books_loaned_but_available(conn)
+    assert len(detectados) == 1
+    assert detectados[0]["title"] == "Dom Casmurro"
+    assert detectados[0]["status"] == "Disponível"
+    assert detectados[0]["full_name"] == "Leitor A"  # quem consta com o livro
+
+
+def test_sentido_inverso_tambem_pega_em_manutencao(livro_emprestado):
+    conn, book_id, _ = livro_emprestado
+    conn.execute(text("UPDATE books SET status = 'Em Manutenção' WHERE id = :i"), {"i": book_id})
+    conn.commit()
+    assert app.count_books_loaned_but_available(conn) == 1
+
+
+def test_os_dois_sentidos_da_inconsistencia_sao_contados_separadamente(conn):
+    """Reconciliação normal e sentido inverso não se confundem: cada um tem a
+    sua contagem, porque a correção de cada um é diferente."""
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senha1234", "leitor")
+    pendente = add_book(conn, "Sem registro", "Autor A", "Literária")
+    invertido = add_book(conn, "Com registro", "Autor B", "Literária")
+    conn.commit()
+
+    # sentido A: Emprestado sem loan ativo
+    conn.execute(text("UPDATE books SET status = 'Emprestado' WHERE code = :c"), {"c": pendente})
+    # sentido B: loan ativo com status liberado
+    invertido_id = conn.execute(
+        text("SELECT id FROM books WHERE code = :c"), {"c": invertido}
+    ).scalar_one()
+    request_loan(conn, invertido_id, get_user_by_email(conn, "leitor@teste.org")["id"])
+    conn.execute(text("UPDATE books SET status = 'Disponível' WHERE id = :i"), {"i": invertido_id})
+    conn.commit()
+
+    assert count_unreconciled_books(conn) == 1
+    assert app.count_books_loaned_but_available(conn) == 1
+
+    # a lista acionável da Reconciliação não mistura os dois
+    pendentes = list_unreconciled_books(conn)
+    assert [p["title"] for p in pendentes] == ["Sem registro"]
+
+
+def test_base_consistente_nao_reporta_nenhum_dos_dois_sentidos(livro_emprestado):
+    conn, _, _ = livro_emprestado
+    assert count_unreconciled_books(conn) == 0
+    assert app.count_books_loaned_but_available(conn) == 0
+
+
+# ---------------------------------------------------------------------------
+# Concorrência em empréstimo, devolução e exclusão (achado 5)
+# ---------------------------------------------------------------------------
+# Mesmo padrão de duas conexões simultâneas já usado na Reconciliação: o
+# segundo a confirmar age sobre um estado obsoleto e precisa falhar, em vez
+# de duplicar o empréstimo do mesmo exemplar físico.
+
+def _book_status(conn, book_id) -> str:
+    return conn.execute(
+        text("SELECT status FROM books WHERE id = :i"), {"i": book_id}
+    ).scalar_one()
+
+
+@pytest.fixture
+def livro_disputado(tmp_path):
+    """Um livro Disponível e dois leitores, com conexões independentes."""
+    database_url = f"sqlite:///{tmp_path}/disputa.db"
+    engine = get_engine(database_url)
+    create_schema(engine)
+
+    setup = get_connection(database_url)
+    create_user(setup, "Leitor A", "a@teste.org", "", "senha1234", "leitor")
+    create_user(setup, "Leitor B", "b@teste.org", "", "senha1234", "leitor")
+    code = add_book(setup, "Livro Disputado", "Ana Silva", "Literária")
+    setup.commit()
+    book_id = setup.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    leitor_a = get_user_by_email(setup, "a@teste.org")["id"]
+    leitor_b = get_user_by_email(setup, "b@teste.org")["id"]
+    setup.close()
+
+    sessao_a = get_connection(database_url)
+    sessao_b = get_connection(database_url)
+    yield sessao_a, sessao_b, book_id, leitor_a, leitor_b
+    sessao_a.close()
+    sessao_b.close()
+
+
+def test_dois_leitores_emprestando_o_mesmo_livro_so_um_vence(livro_disputado):
+    sessao_a, sessao_b, book_id, leitor_a, leitor_b = livro_disputado
+
+    # os dois carregaram o catálogo e veem o livro como Disponível
+    for sessao in (sessao_a, sessao_b):
+        assert count_books(sessao, status="Disponível") == 1
+
+    request_loan(sessao_a, book_id, leitor_a)
+    sessao_a.commit()
+
+    with pytest.raises(ValueError, match="indisponível"):
+        request_loan(sessao_b, book_id, leitor_b)
+    sessao_b.rollback()
+
+    ativos = sessao_a.execute(
+        text("SELECT COUNT(*) FROM loans WHERE book_id = :b AND status = 'ativo'"),
+        {"b": book_id},
+    ).scalar_one()
+    assert ativos == 1
+    assert _book_status(sessao_a, book_id) == "Emprestado"
+
+
+def test_duas_devolucoes_simultaneas_do_mesmo_emprestimo(livro_disputado):
+    sessao_a, sessao_b, book_id, leitor_a, _ = livro_disputado
+    request_loan(sessao_a, book_id, leitor_a)
+    sessao_a.commit()
+    loan_id = get_active_loan_for_book(sessao_a, book_id)["id"]
+
+    return_loan(sessao_a, loan_id)
+    sessao_a.commit()
+
+    with pytest.raises(ValueError, match="não está ativo"):
+        return_loan(sessao_b, loan_id)
+    sessao_b.rollback()
+
+    devolvidos = sessao_a.execute(
+        text("SELECT COUNT(*) FROM loans WHERE id = :i AND status = 'devolvido'"),
+        {"i": loan_id},
+    ).scalar_one()
+    assert devolvidos == 1
+
+
+def test_emprestimo_criado_apos_a_checagem_impede_a_exclusao_do_livro(livro_disputado):
+    """A exclusão não pode levar junto um empréstimo ativo que apareceu no
+    meio do caminho: a FK barra a remoção em vez de o histórico sumir."""
+    sessao_a, sessao_b, book_id, leitor_a, _ = livro_disputado
+
+    # histórico já devolvido, que a exclusão normalmente levaria junto
+    request_loan(sessao_a, book_id, leitor_a)
+    sessao_a.commit()
+    return_loan(sessao_a, get_active_loan_for_book(sessao_a, book_id)["id"])
+    sessao_a.commit()
+
+    # outra sessão empresta de novo antes da exclusão ser confirmada
+    request_loan(sessao_b, book_id, leitor_a)
+    sessao_b.commit()
+
+    with pytest.raises(ValueError, match="emprestado no momento"):
+        delete_book(sessao_a, book_id)
+    sessao_a.rollback()
+
+    assert _books_count(sessao_a, book_id) == 1
+    assert _loans_count_for(sessao_a, book_id) == 2  # nenhum registro foi perdido
+
+
+def test_delete_book_de_livro_ja_removido_avisa_em_vez_de_seguir(livro_disputado):
+    sessao_a, sessao_b, book_id, _, _ = livro_disputado
+    delete_book(sessao_a, book_id)
+    sessao_a.commit()
+
+    with pytest.raises(ValueError, match="não encontrado"):
+        delete_book(sessao_b, book_id)
+    sessao_b.rollback()
+
+
+def test_request_loan_recusa_livro_em_manutencao(conn):
+    code = add_book(conn, "Em conserto", "Autor X", "Literária")
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    conn.execute(text("UPDATE books SET status = 'Em Manutenção' WHERE id = :i"), {"i": book_id})
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor@teste.org")["id"]
+
+    with pytest.raises(ValueError, match="indisponível"):
+        request_loan(conn, book_id, leitor)
+    conn.rollback()
+
+    assert _loans_count_for(conn, book_id) == 0
+    assert _book_status(conn, book_id) == "Em Manutenção"
+
+
+def test_request_loan_em_livro_inexistente_nao_cria_loan_orfao(conn):
+    create_user(conn, "Leitor", "leitor@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+    leitor = get_user_by_email(conn, "leitor@teste.org")["id"]
+
+    with pytest.raises(ValueError, match="indisponível"):
+        request_loan(conn, 99999, leitor)
+    conn.rollback()
+
+    assert conn.execute(text("SELECT COUNT(*) FROM loans")).scalar_one() == 0
+
+
+# ---------------------------------------------------------------------------
 # Sequencial por PREFIXO (MAX), não por contagem de livros do autor
 # ---------------------------------------------------------------------------
 # Regressão do achado 4 da revisão: derivar o sequencial de COUNT(livros do
@@ -2057,7 +2711,7 @@ def test_dias_de_atraso_reportados_corretamente(emprestimos_variados):
 
 # --- migração --------------------------------------------------------------
 
-def test_migracao_adiciona_due_date_preservando_emprestimos_existentes(tmp_path):
+def test_migracao_adiciona_due_date_preservando_emprestimos_existentes(tmp_path, bootstrap_secrets):
     """Banco criado antes do recurso: ALTER TABLE adiciona a coluna sem
     perder dados, e os empréstimos antigos ficam com due_date nulo."""
     import sqlite3
@@ -2961,7 +3615,7 @@ def test_sessao_aberta_em_outra_aba_cai_no_proximo_clique(tmp_path, monkeypatch)
     from streamlit.testing.v1 import AppTest
 
     database_url = f"sqlite:///{tmp_path}/sessao_revogada.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
 
     with get_connection(database_url) as connection:
         create_schema(get_engine(database_url))
@@ -3010,7 +3664,7 @@ def _abre_gestao_de_usuarios(tmp_path, monkeypatch, nome_db):
     from streamlit.testing.v1 import AppTest
 
     database_url = f"sqlite:///{tmp_path}/{nome_db}.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
 
     at = AppTest.from_file("app.py")
     at.run()
@@ -3089,7 +3743,7 @@ def test_tela_nao_oferece_reset_para_a_propria_conta_do_admin(tmp_path, monkeypa
     at, database_url = _abre_gestao_de_usuarios(tmp_path, monkeypatch, "auto_reset")
 
     with get_connection(database_url) as connection:
-        admin = get_user_by_email(connection, "admin@biblioteca.org")
+        admin = get_user_by_email(connection, BOOTSTRAP_EMAIL)
 
     assert not [b for b in at.button if b.key == f"reset_{admin['id']}"]
     assert any(
@@ -3116,7 +3770,7 @@ def test_tela_permite_admin_redefinir_senha_de_outro_admin(tmp_path, monkeypatch
         recuperado = authenticate(connection, "admin2@teste.org", temporaria)
         assert recuperado is not None and recuperado["role"] == "admin"
         registros = list_admin_audit(connection)
-        assert registros[0]["actor_email"] == "admin@biblioteca.org"
+        assert registros[0]["actor_email"] == BOOTSTRAP_EMAIL
         assert registros[0]["target_email"] == "admin2@teste.org"
 
 
@@ -3215,7 +3869,7 @@ def test_try_create_account_recusa_email_duplicado(conn):
     assert count_admins(conn) == 1
 
 
-def test_migracao_adiciona_session_version_sem_deslogar_ninguem(tmp_path):
+def test_migracao_adiciona_session_version_sem_deslogar_ninguem(tmp_path, bootstrap_secrets):
     """Banco criado antes deste recurso: a coluna entra com 0 em todas as
     contas, que é o mesmo valor que uma sessão aberta antes da migração
     carregaria — a invalidação só começa no primeiro reset."""
@@ -3245,7 +3899,7 @@ def test_migracao_adiciona_session_version_sem_deslogar_ninguem(tmp_path):
         assert _session_is_current(connection, app._session_user_view(admin)) is True
 
 
-def test_reset_e_liberacao_do_bloqueio_sao_commitados_juntos(tmp_path):
+def test_reset_e_liberacao_do_bloqueio_sao_commitados_juntos(tmp_path, bootstrap_secrets):
     """Reset, liberação do rate limit e auditoria fecham na mesma transação —
     e ficam visíveis em uma conexão nova, não só na que executou."""
     database_url = f"sqlite:///{tmp_path}/reset_commit.db"
@@ -3274,7 +3928,7 @@ def test_login_bem_sucedido_limpa_o_bloqueio_de_forma_duravel(tmp_path, monkeypa
     from streamlit.testing.v1 import AppTest
 
     database_url = f"sqlite:///{tmp_path}/login_commit.db"
-    monkeypatch.setattr(app.st, "secrets", {"DATABASE_URL": database_url})
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
     create_schema(get_engine(database_url))
     with get_connection(database_url) as connection:
         create_user(connection, "Maria", "maria@teste.org", "", "senhaCerta12", "leitor")

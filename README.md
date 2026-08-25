@@ -76,17 +76,34 @@ automaticamente no Postgres, junto com o usuário administrador padrão. O
 catálogo começa **vazio**: os livros entram pela carga real do acervo, seja
 pelo cadastro manual (**Gestão de Livros**) ou pela **Importação via CSV**.
 
-### Administrador padrão do primeiro boot
+### Administrador inicial
 
 No primeiro boot — e sempre que o banco não tiver **nenhuma** conta de
-administrador — o sistema cria automaticamente um administrador padrão, já
-marcado com `must_change_password`: ele cai direto na tela **Alterar minha
-senha** e não acessa nenhuma outra tela até definir uma senha nova.
+administrador — o sistema cria automaticamente um administrador, já marcado
+com `must_change_password`: ele cai direto na tela **Alterar minha senha** e
+não acessa nenhuma outra tela até definir uma senha nova.
 
-As credenciais iniciais dessa conta estão **no código-fonte**, em
-`_ensure_initialized` (`app.py`) — este README não as repete de propósito.
-Quem faz o deploy consulta o código; quem só lê a documentação não recebe uma
-senha pronta para usar.
+As credenciais dessa conta vêm dos **Secrets**, nunca do código:
+
+| Chave | Para quê |
+|---|---|
+| `BOOTSTRAP_ADMIN_EMAIL` | E-mail de login do admin inicial |
+| `BOOTSTRAP_ADMIN_PASSWORD` | Senha inicial (mínimo 8 caracteres) |
+
+Localmente elas ficam em `.streamlit/secrets.toml`; em produção, nos Secrets do
+Streamlit Community Cloud (*Settings → Secrets*). Ver
+`.streamlit/secrets.toml.example`.
+
+> **Não existe senha padrão de fallback.** Se o banco não tiver admin e essas
+> chaves não estiverem configuradas, o app exibe a instrução do que configurar
+> e **para** — em vez de criar uma conta com senha conhecida. Este repositório
+> é público: qualquer literal no código seria uma credencial publicada. Um app
+> que sobe sem admin é recuperável (basta configurar o segredo e recarregar);
+> um admin com senha pública, não.
+>
+> Escolha um e-mail que **não seja adivinhável**: ele também é a chave do
+> bloqueio por tentativas de login, então um e-mail de admin conhecido pode ser
+> usado para manter a conta travada.
 
 > **Troque a senha logo no primeiro acesso.** A troca obrigatória fecha a
 > maior parte do risco, mas ela só acontece quando alguém loga: entre um boot
@@ -149,8 +166,8 @@ senha** no menu.
 Um admin pode redefinir a senha de outro admin — é assim que o acesso
 administrativo se recupera dentro da aplicação. Mas isso só funciona se
 **existir mais de um administrador**: o bootstrap automático só recria a conta
-`admin@biblioteca.org` quando **não há nenhum admin** no banco, então um único
-admin com a senha perdida trava o sistema inteiro.
+do `BOOTSTRAP_ADMIN_EMAIL` quando **não há nenhum admin** no banco, então um
+único admin com a senha perdida trava o sistema inteiro.
 
 Por isso, enquanto houver só um administrador, a tela **Gestão de Usuários**
 exibe um aviso recomendando cadastrar o segundo. Use o formulário
@@ -180,7 +197,7 @@ DATABASE_URL = "postgresql://..."      # a mesma do .streamlit/secrets.toml
 OPERADOR = {"id": None, "email": "recuperacao-local@cli"}   # aparece na auditoria
 
 with get_connection(DATABASE_URL) as conn:
-    admin = get_user_by_email(conn, "admin@biblioteca.org")
+    admin = get_user_by_email(conn, "SEU_ADMIN@DOMINIO.org")
     print("senha temporária:", admin_reset_password(conn, OPERADOR, admin["id"]))
 ```
 
@@ -211,7 +228,7 @@ DATABASE_URL = "postgresql://..."
 
 with get_connection(DATABASE_URL) as conn:
     print(try_create_account(
-        conn, "Administrador", "admin@biblioteca.org", "",
+        conn, "Administrador", "biblioteca@SEU_DOMINIO.org", "",
         "TROQUE-POR-UMA-SENHA-FORTE", "admin", must_change_password=True,
     ))
 ```
