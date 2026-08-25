@@ -43,6 +43,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     ForeignKey,
+    Index,
     Integer,
     MetaData,
     Table,
@@ -56,7 +57,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +225,24 @@ loans_table = Table(
     Column("return_date", Text),
     Column("status", Text, nullable=False, server_default="ativo"),
     CheckConstraint("status IN ('ativo','devolvido')", name="ck_loans_status"),
+    # Colunas usadas em junção e filtro nas telas de empréstimo, no painel e na
+    # subconsulta EXISTS da reconciliação. Sem índice, cada uma delas é uma
+    # varredura da tabela inteira.
+    Index("ix_loans_book_id", "book_id"),
+    Index("ix_loans_user_id", "user_id"),
+    Index("ix_loans_status", "status"),
+    Index("ix_loans_due_date", "due_date"),
 )
+
+# Índices do acervo. A busca textual NÃO é coberta por eles: _sql_unaccent
+# envolve a coluna em REPLACE aninhados, e uma expressão assim não usa índice
+# de coluna. Cobrir a busca exigiria coluna gerada + pg_trgm, que só existe no
+# Postgres e quebraria a paridade com o SQLite dos testes — não compensa no
+# volume atual (~2,5 mil livros). Estes aqui servem aos filtros e à ordenação.
+Index("ix_books_status", books_table.c.status)
+Index("ix_books_category", books_table.c.category)
+Index("ix_books_title", books_table.c.title)
+Index("ix_books_author", books_table.c.author)
 
 
 def _get_database_url_from_secrets() -> str:
@@ -356,11 +374,64 @@ def _migrate_add_users_session_version(engine: Engine) -> None:
         )
 
 
+def _index_statements(concurrently: bool) -> list[str]:
+    """CREATE INDEX de todos os índices declarados no metadata.
+
+    Gerado a partir do próprio metadata para não haver duas listas de índices
+    para divergirem: declarar um Index na Table basta para bancos novos (via
+    create_all) e para os já existentes (via esta migração).
+    """
+    modifier = "CONCURRENTLY " if concurrently else ""
+    statements = []
+    for table in metadata.tables.values():
+        for index in sorted(table.indexes, key=lambda i: i.name):
+            columns = ", ".join(column.name for column in index.columns)
+            statements.append(
+                f"CREATE INDEX {modifier}IF NOT EXISTS {index.name} "
+                f"ON {table.name} ({columns})"
+            )
+    return statements
+
+
+def _migrate_add_indexes(engine: Engine) -> None:
+    """Cria os índices que faltam em um banco já em uso.
+
+    metadata.create_all() cria índices apenas junto com a tabela — numa tabela
+    que já existe (o Supabase do CCE) ele não faz nada, então a criação precisa
+    ser explícita.
+
+    No Postgres usa CONCURRENTLY, para não travar escrita no acervo enquanto o
+    índice é construído. CONCURRENTLY não pode rodar dentro de transação, daí o
+    isolation_level AUTOCOMMIT; no SQLite dos testes o CREATE INDEX comum roda
+    na transação normal.
+
+    Falha em criar índice não impede o app de subir: índice é desempenho, não
+    correção. Um CONCURRENTLY interrompido deixa índice inválido no Postgres,
+    que a próxima execução não recria (IF NOT EXISTS o considera existente) —
+    se a lentidão persistir, conferir com \\di+ e recriar à mão.
+    """
+    is_postgres = engine.dialect.name == "postgresql"
+    statements = _index_statements(concurrently=is_postgres)
+
+    if is_postgres:
+        context = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    else:
+        context = engine.begin()
+
+    with context as conn:
+        for statement in statements:
+            try:
+                conn.execute(text(statement))
+            except SQLAlchemyError:
+                continue
+
+
 def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
     _migrate_add_loans_due_date(engine)
     _migrate_add_users_must_change_password(engine)
     _migrate_add_users_session_version(engine)
+    _migrate_add_indexes(engine)
 
 
 BOOTSTRAP_ADMIN_EMAIL_KEY = "BOOTSTRAP_ADMIN_EMAIL"
@@ -526,9 +597,30 @@ def get_user_by_email(conn, email):
     ).mappings().first()
 
 
+# Hash descartável, contra o qual a senha é conferida quando o e-mail não
+# existe. Não é credencial de ninguém: serve só para o login gastar o mesmo
+# tempo nos dois casos. Gerado sob demanda para não pagar um bcrypt no import.
+_dummy_password_hash: str | None = None
+
+
+def _timing_equalizer_hash() -> str:
+    global _dummy_password_hash
+    if _dummy_password_hash is None:
+        _dummy_password_hash = hash_password(secrets.token_urlsafe(16))
+    return _dummy_password_hash
+
+
 def authenticate(conn, email, password):
     user = get_user_by_email(conn, email)
-    if not user or not verify_password(password, user["password_hash"], user["salt"]):
+    if not user:
+        # Confere contra um hash descartável antes de desistir: sem isso o
+        # e-mail inexistente responde na hora e o existente demora o bcrypt,
+        # e a diferença de tempo diz qual é qual. A tabela login_attempts já
+        # foi feita para não distinguir os dois casos na mensagem — o relógio
+        # não pode entregar o que a mensagem esconde.
+        verify_password(password, _timing_equalizer_hash(), "")
+        return None
+    if not verify_password(password, user["password_hash"], user["salt"]):
         return None
     if not _is_bcrypt_hash(user["password_hash"]):
         # Login bem-sucedido com hash no formato legado: re-hasheia para
@@ -1442,14 +1534,48 @@ def _detect_csv_delimiter(text: str) -> str:
     return best_delimiter
 
 
+# Codificações tentadas, na ordem. UTF-8 primeiro porque é o formato correto e
+# o único que pode ser detectado com segurança (byte inválido = não é UTF-8).
+# cp1252 depois: é o que o Excel em português no Windows gera ao salvar "CSV
+# (separado por vírgulas)", e o acervo do CCE é cheio de acento. latin-1 por
+# último, como rede: cobre os poucos bytes que cp1252 não define.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
+
+CSV_ENCODING_ERROR = (
+    "Não foi possível ler o arquivo: ele não parece ser um CSV de texto. Se o "
+    "arquivo veio do Excel, abra-o e use **Arquivo → Salvar como → CSV UTF-8 "
+    "(delimitado por vírgulas)** — o formato \"Unicode\" e as planilhas .xlsx "
+    "não são lidos aqui."
+)
+
+
+def _decode_csv_bytes(data: bytes) -> str:
+    """Texto do CSV, tentando as codificações que o cliente realmente usa.
+
+    latin-1 decodifica QUALQUER byte sem erro, então a cascata nunca chega ao
+    fim por UnicodeDecodeError — o que é bom para arquivos acentuados e ruim
+    para arquivos que não são texto: um .xlsx ou um CSV em UTF-16 viraria
+    caractere ilegível em vez de erro. Por isso a validação real não é o
+    decode, e sim o NUL: texto de verdade não tem \\x00, e UTF-16 e binário
+    têm aos montes.
+    """
+    for encoding in CSV_ENCODINGS:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if "\x00" in text:
+            break
+        return text
+    raise ValueError(CSV_ENCODING_ERROR)
+
+
 def parse_csv_bytes(data: bytes) -> list[dict]:
-    """Decodifica bytes de um CSV (UTF-8 com ou sem BOM, CRLF ou LF) e
-    detecta o delimitador (',' ou ';') automaticamente. Retorna uma lista de
-    dicts com as chaves das colunas normalizadas (minúsculas, sem espaços)."""
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8")
+    """Decodifica bytes de um CSV (UTF-8 com ou sem BOM, cp1252 ou latin-1;
+    CRLF ou LF) e detecta o delimitador (',' ou ';') automaticamente. Retorna
+    uma lista de dicts com as chaves das colunas normalizadas (minúsculas,
+    sem espaços)."""
+    text = _decode_csv_bytes(data)
 
     delimiter = _detect_csv_delimiter(text)
 
@@ -1543,23 +1669,56 @@ def process_import_rows(conn, rows: list[dict]) -> tuple[list[dict], dict]:
 
 
 def commit_import(conn, processed_rows: list[dict]) -> int:
+    """Grava as linhas processadas de uma importação, em uma transação só.
+
+    Recusa o lote inteiro se alguma linha estiver marcada com erro, em vez de
+    confiar que o botão da tela continua desabilitado: a validação de
+    process_import_rows é um retrato do banco no momento da pré-visualização, e
+    quem chama esta função pode não ser aquela tela.
+
+    Recusar, e não pular: se uma linha com erro chegou até aqui, o pressuposto
+    da tela foi violado — importar as outras deixaria uma carga pela metade,
+    silenciosamente incompleta, num arquivo que o operador acredita ter
+    importado inteiro.
+    """
+    blocked = [row["linha"] for row in processed_rows if row.get("erros")]
+    if blocked:
+        linhas = ", ".join(str(n) for n in blocked[:10])
+        reticencias = "…" if len(blocked) > 10 else ""
+        raise ValueError(
+            f"{len(blocked)} linha(s) ainda têm erro bloqueante e nada foi importado "
+            f"(linha(s) {linhas}{reticencias}). Corrija o arquivo ou o mapeamento e "
+            "reenvie."
+        )
+
     now = datetime.now().isoformat(timespec="seconds")
     count = 0
     for row in processed_rows:
-        conn.execute(
-            text(
-                """INSERT INTO books (code, title, author, category, status, created_at)
-                   VALUES (:code, :title, :author, :category, :status, :created_at)"""
-            ),
-            {
-                "code": row["codigo"],
-                "title": row["titulo"],
-                "author": row["autor"],
-                "category": row["categoria"],
-                "status": row["status"],
-                "created_at": now,
-            },
-        )
+        try:
+            conn.execute(
+                text(
+                    """INSERT INTO books (code, title, author, category, status, created_at)
+                       VALUES (:code, :title, :author, :category, :status, :created_at)"""
+                ),
+                {
+                    "code": row["codigo"],
+                    "title": row["titulo"],
+                    "author": row["autor"],
+                    "category": row["categoria"],
+                    "status": row["status"],
+                    "created_at": now,
+                },
+            )
+        except IntegrityError as exc:
+            # Alguém cadastrou este código entre a pré-visualização e o clique.
+            # Vira ValueError com a linha e o código identificados: sem isso o
+            # operador recebe um erro de constraint sem saber onde olhar.
+            raise ValueError(
+                f"A linha {row['linha']} usa o código '{row['codigo']}', que já existe "
+                "no acervo — provavelmente cadastrado por outra pessoa depois que esta "
+                "pré-visualização foi gerada. Nada foi importado; reenvie o arquivo "
+                "para recalcular os códigos."
+            ) from exc
         count += 1
     return count
 
@@ -1675,6 +1834,22 @@ def return_loan(conn, loan_id):
 # Telas (UI)
 # ---------------------------------------------------------------------------
 
+# A tela pública DIZ que o e-mail já tem cadastro, em vez de responder algo
+# neutro. É uma decisão consciente, não um descuido: a mensagem neutra ("se
+# este e-mail ainda não estava em uso, a conta foi criada") fecha a enumeração
+# de contas, mas deixa sem saída quem só esqueceu que já tinha cadastro — e
+# esse é o caso comum numa biblioteca comunitária, enquanto o atacante que
+# enumera e-mails é o caso raro. Aqui a orientação vale mais que o sigilo.
+#
+# O vazamento por TEMPO no login continua fechado (ver _timing_equalizer_hash):
+# aquilo não custava usabilidade nenhuma, então não há motivo para abrir mão.
+SIGNUP_DUPLICATE_MESSAGE = (
+    "Já existe um cadastro com esse e-mail. Use a aba **Entrar** para acessar "
+    "sua conta. Se não lembra a senha, peça a um administrador da biblioteca "
+    "para redefini-la — a redefinição é presencial."
+)
+
+
 def show_auth_screen(conn):
     st.title("Biblioteca Comunitária")
     tab_login, tab_cadastro = st.tabs(["Entrar", "Cadastrar-se"])
@@ -1727,16 +1902,19 @@ def show_auth_screen(conn):
                         st.error(strength_error)
                         has_error = True
                 if not has_error and get_user_by_email(conn, email_c):
-                    st.error("Já existe um cadastro com esse e-mail.")
+                    st.error(SIGNUP_DUPLICATE_MESSAGE)
                     has_error = True
                 if not has_error:
-                    success, error_message = try_create_reader(
+                    success, _ = try_create_reader(
                         conn, full_name, email_c, phone, password_c
                     )
                     if success:
                         st.success("Cadastro realizado! Faça login na aba ao lado.")
                     else:
-                        st.error(error_message)
+                        # Corrida entre a checagem acima e o INSERT: a única
+                        # falha que try_create_reader reporta é o e-mail
+                        # duplicado, então a orientação é a mesma.
+                        st.error(SIGNUP_DUPLICATE_MESSAGE)
 
 
 def show_change_password_screen(conn, user, forced: bool = False):
@@ -2935,7 +3113,8 @@ def show_csv_import(conn):
     st.caption(
         "O arquivo **não precisa** vir no formato interno: depois do upload você "
         "escolhe qual coluna do arquivo corresponde a cada campo. Delimitador `,` ou "
-        "`;` e encoding UTF-8 (com ou sem BOM) são detectados automaticamente."
+        "`;` e codificação (UTF-8, com ou sem BOM, ou a do Excel no Windows) são "
+        "detectados automaticamente."
     )
     uploaded = st.file_uploader("Selecione o arquivo CSV", type=["csv"])
 

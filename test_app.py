@@ -250,6 +250,80 @@ def test_parse_csv_bytes_com_bom_utf8_sig():
     assert list(rows[0].keys())[0] == "titulo"
 
 
+# --- codificação: o Excel em português não salva UTF-8 (achado 8) ----------
+
+# Linha com a acentuação que o acervo do CCE tem de verdade — é o que quebrava
+# o import inteiro com UnicodeDecodeError.
+_LINHA_ACENTUADA = (
+    "titulo,autor,categoria\n"
+    "Memórias Póstumas de Brás Cubas,Machado de Assis,Literária\n"
+    "A Divina Comédia,Dante Alighieri,Espiritual\n"
+)
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "cp1252", "latin-1"])
+def test_parse_csv_bytes_le_acentuacao_em_todas_as_codificacoes(encoding):
+    rows = parse_csv_bytes(_LINHA_ACENTUADA.encode(encoding))
+
+    assert rows[0]["titulo"] == "Memórias Póstumas de Brás Cubas"
+    assert rows[0]["categoria"] == "Literária"
+    assert rows[1]["titulo"] == "A Divina Comédia"
+
+
+def test_parse_csv_bytes_arquivo_real_do_excel_em_cp1252():
+    """Perfil do que o Excel PT-BR no Windows gera: cp1252, ';' e CRLF."""
+    conteudo = (
+        "Título;Autor;Código-antigo\r\n"
+        "Memórias Póstumas;Machado de Assis;461\r\n"
+        "Ação e Reação;Chico Xavier;1091\r\n"
+    )
+    rows = parse_csv_bytes(conteudo.encode("cp1252"))
+
+    assert list(rows[0].keys()) == ["título", "autor", "código-antigo"]
+    assert rows[0]["título"] == "Memórias Póstumas"
+    assert rows[1]["título"] == "Ação e Reação"
+    assert rows[1]["código-antigo"] == "1091"
+
+
+def test_cp1252_com_aspas_tipograficas_do_word():
+    """0x93/0x94 são aspas no cp1252 e indefinidos no latin-1 — se a ordem da
+    cascata invertesse, viriam como caractere de controle."""
+    dados = b"titulo,autor\n\x93O Corti\xe7o\x94,Alu\xedsio Azevedo\n"
+    rows = parse_csv_bytes(dados)
+    assert rows[0]["titulo"] == "“O Cortiço”"
+    assert rows[0]["autor"] == "Aluísio Azevedo"
+
+
+def test_arquivo_binario_ou_utf16_falha_com_instrucao_de_salvar_em_utf8():
+    """latin-1 decodifica qualquer byte, então sem a checagem de NUL um .xlsx
+    ou um CSV em UTF-16 viraria lixo silencioso em vez de erro."""
+    utf16 = _LINHA_ACENTUADA.encode("utf-16")
+    with pytest.raises(ValueError, match="CSV UTF-8"):
+        parse_csv_bytes(utf16)
+
+    xlsx_falso = b"PK\x03\x04\x14\x00\x00\x00\x08\x00" + b"\x00" * 40
+    with pytest.raises(ValueError, match="CSV UTF-8"):
+        parse_csv_bytes(xlsx_falso)
+
+
+def test_tela_de_importacao_explica_o_que_fazer_com_arquivo_ilegivel(conn, monkeypatch):
+    """A mensagem chega ao usuário pela tela, sem traceback."""
+
+    class FakeUpload:
+        name = "acervo.xlsx"
+        size = 100
+
+        def getvalue(self):
+            return b"PK\x03\x04" + b"\x00" * 40
+
+    tela = _Tela(monkeypatch, session=_SessionStateFake())
+    monkeypatch.setattr(app.st, "file_uploader", lambda *a, **k: FakeUpload())
+
+    app.show_csv_import(conn)
+
+    assert "Salvar como" in tela.texto and "CSV UTF-8" in tela.texto
+
+
 # ---------------------------------------------------------------------------
 # _detect_csv_delimiter — detecção robusta (bug real: espiritual.csv era lido
 # como uma única coluna quando as primeiras linhas não tinham campos citados)
@@ -737,6 +811,103 @@ def test_init_db_nao_reinsere_livros_apos_reinicio(tmp_path, bootstrap_secrets):
         assert rows[0]["code"] == "ASSM-001"  # código real do cliente preservado
 
 
+# --- índices (achado 11) ---------------------------------------------------
+
+# Colunas usadas em junção, filtro e ordenação. A busca textual fica de fora de
+# propósito: _sql_unaccent envolve a coluna em REPLACE aninhados e nenhum índice
+# de coluna cobre isso (a parte cara do achado 11, que não compensa neste volume).
+INDICES_ESPERADOS = {
+    "loans": {"book_id", "user_id", "status", "due_date"},
+    "books": {"status", "category", "title", "author"},
+}
+
+
+def _indexed_columns(engine, table: str) -> set[str]:
+    from sqlalchemy import inspect as sa_inspect
+
+    colunas = set()
+    for index in sa_inspect(engine).get_indexes(table):
+        colunas.update(c for c in index["column_names"] if c)
+    return colunas
+
+
+@pytest.mark.parametrize("tabela,colunas", sorted(INDICES_ESPERADOS.items()))
+def test_banco_novo_nasce_com_os_indices(tmp_path, tabela, colunas):
+    engine = get_engine(f"sqlite:///{tmp_path}/indices_novo.db")
+    create_schema(engine)
+
+    assert colunas <= _indexed_columns(engine, tabela)
+
+
+@pytest.mark.parametrize("tabela,colunas", sorted(INDICES_ESPERADOS.items()))
+def test_banco_ja_existente_ganha_os_indices_na_migracao(tmp_path, tabela, colunas):
+    """create_all só cria índice junto com a tabela: num banco em uso (o
+    Supabase do CCE) a criação precisa ser explícita."""
+    database_url = f"sqlite:///{tmp_path}/indices_legado.db"
+    engine = get_engine(database_url)
+
+    # banco "antigo": tabelas criadas sem nenhum índice declarado
+    metadata_sem_indices = app.MetaData()
+    for nome, tabela_orig in app.metadata.tables.items():
+        colunas_copia = [c._copy() for c in tabela_orig.columns]
+        app.Table(nome, metadata_sem_indices, *colunas_copia)
+    metadata_sem_indices.create_all(engine)
+    assert not _indexed_columns(engine, tabela) >= colunas
+
+    create_schema(engine)  # a migração roda sobre a tabela que já existe
+
+    assert colunas <= _indexed_columns(engine, tabela)
+
+
+def test_migracao_de_indices_e_idempotente(tmp_path):
+    """Roda a cada restart do container: não pode falhar na segunda vez."""
+    engine = get_engine(f"sqlite:///{tmp_path}/indices_idem.db")
+    create_schema(engine)
+    create_schema(engine)
+    create_schema(engine)
+
+    assert INDICES_ESPERADOS["books"] <= _indexed_columns(engine, "books")
+
+
+def test_indices_do_postgres_usam_concurrently_para_nao_travar_escrita():
+    """No acervo real o índice é construído com o app no ar."""
+    postgres = app._index_statements(concurrently=True)
+    sqlite = app._index_statements(concurrently=False)
+
+    assert postgres and len(postgres) == len(sqlite)
+    assert all(s.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS") for s in postgres)
+    assert all(s.startswith("CREATE INDEX IF NOT EXISTS") for s in sqlite)
+
+
+def test_lista_de_indices_vem_do_metadata_sem_segunda_lista_para_divergir():
+    declarados = {
+        (tabela.name, coluna.name)
+        for tabela in app.metadata.tables.values()
+        for indice in tabela.indexes
+        for coluna in indice.columns
+    }
+    esperados = {
+        (tabela, coluna)
+        for tabela, colunas in INDICES_ESPERADOS.items()
+        for coluna in colunas
+    }
+    assert esperados <= declarados
+
+
+def test_indice_que_falha_nao_impede_o_app_de_subir(tmp_path, monkeypatch):
+    """Índice é desempenho, não correção: um erro ao criá-lo não pode derrubar
+    a inicialização do banco inteiro."""
+    engine = get_engine(f"sqlite:///{tmp_path}/indices_falha.db")
+    monkeypatch.setattr(
+        app, "_index_statements", lambda concurrently: ["CREATE INDEX isso nao e sql valido"]
+    )
+
+    create_schema(engine)  # não levanta
+
+    with get_connection(f"sqlite:///{tmp_path}/indices_falha.db") as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 0
+
+
 # --- credenciais iniciais vindas dos Secrets (achado 1) --------------------
 
 def test_bootstrap_sem_segredos_nao_cria_admin_e_explica_o_que_configurar(
@@ -1044,6 +1215,109 @@ def test_try_create_reader_cadastro_concorrente_mesmo_email_nao_vaza_excecao(con
         text("SELECT COUNT(*) AS n FROM users WHERE email = 'duplicado@teste.org'")
     ).mappings().first()["n"]
     assert count == 1  # só o primeiro cadastro foi persistido
+
+
+# --- enumeração de contas: só o canal de tempo é fechado (achado 10) -------
+# A tela pública informa explicitamente o e-mail já cadastrado, por decisão de
+# produto: quem esqueceu que já tinha conta é o caso comum numa biblioteca
+# comunitária, e a mensagem neutra o deixava sem saída. O vazamento por tempo
+# no login, que não custa usabilidade, continua fechado.
+
+def _cadastrar_pela_tela_publica(conn, monkeypatch, email, nome="Fulano de Tal"):
+    tela = _Tela(monkeypatch, submits={"Cadastrar"}, session=_SessionStateFake())
+    monkeypatch.setattr(
+        app.st, "tabs", lambda labels: [contextlib.nullcontext()] * len(labels)
+    )
+    campos = {"Nome completo": nome, "E-mail": email, "Senha": "senha1234"}
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
+    app.show_auth_screen(conn)
+    return tela
+
+
+def test_cadastro_publico_avisa_que_o_email_ja_tem_cadastro_e_orienta(
+    conn, monkeypatch
+):
+    create_user(conn, "Já Cadastrada", "existente@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    tela = _cadastrar_pela_tela_publica(conn, monkeypatch, "existente@teste.org")
+
+    assert "Já existe um cadastro com esse e-mail" in tela.texto
+    # a mensagem precisa dizer o que fazer, não só o que deu errado
+    assert "Entrar" in tela.texto
+    assert "administrador" in tela.texto
+    assert tela.sucessos == []
+
+    # e não criou conta duplicada
+    total = conn.execute(
+        text("SELECT COUNT(*) FROM users WHERE email = 'existente@teste.org'")
+    ).scalar_one()
+    assert total == 1
+
+
+def test_cadastro_publico_com_email_novo_cria_a_conta(conn, monkeypatch):
+    tela = _cadastrar_pela_tela_publica(conn, monkeypatch, "nova@teste.org")
+
+    assert tela.erros == []
+    assert "Cadastro realizado" in " ".join(tela.sucessos)
+
+    nova = get_user_by_email(conn, "nova@teste.org")
+    assert nova is not None
+    assert nova["role"] == "leitor"
+
+
+def test_cadastro_duplicado_continua_barrado_pelo_banco(conn):
+    """A mensagem neutra é só de tela: o UNIQUE segue valendo."""
+    create_user(conn, "Primeira", "unica@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    ok, erro = try_create_reader(conn, "Segunda", "unica@teste.org", "", "senha1234")
+    assert ok is False
+    assert erro is not None
+
+    total = conn.execute(
+        text("SELECT COUNT(*) FROM users WHERE email = 'unica@teste.org'")
+    ).scalar_one()
+    assert total == 1
+
+
+def test_cadastro_de_admin_autenticado_ainda_avisa_sobre_email_duplicado(conn):
+    """Só a tela pública fica neutra: para um admin logado, saber que a conta já
+    existe é informação útil, e ele já enxerga a lista de usuários."""
+    create_user(conn, "Existente", "dup@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    ok, erro = try_create_account(
+        conn, "Novo Admin", "dup@teste.org", "", "senha1234", "admin"
+    )
+    assert ok is False
+    assert "Já existe um cadastro" in erro
+
+
+def test_login_gasta_tempo_comparavel_com_email_inexistente_e_senha_errada(conn):
+    """Sem o hash descartável, o e-mail inexistente responde na hora e o
+    existente paga o bcrypt — a diferença de tempo diz qual é qual."""
+    import time
+
+    create_user(conn, "Alguém", "existe@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    def _medir(email):
+        amostras = []
+        for _ in range(3):
+            inicio = time.perf_counter()
+            assert authenticate(conn, email, "senha-errada") is None
+            amostras.append(time.perf_counter() - inicio)
+        return min(amostras)
+
+    inexistente = _medir("naoexiste@teste.org")
+    existente = _medir("existe@teste.org")
+
+    # bcrypt domina os dois caminhos; sem a equalização a razão passa de 100x
+    assert inexistente > existente / 3, (
+        f"e-mail inexistente respondeu rápido demais: {inexistente:.4f}s "
+        f"vs {existente:.4f}s para e-mail existente"
+    )
 
 
 def test_fluxo_completo_de_emprestimo_e_devolucao(conn):
@@ -1362,6 +1636,65 @@ def test_status_normalizado_no_preview_e_erro_para_desconhecido(conn):
     assert summary["com_erro"] == 1
 
 
+def test_commit_import_recusa_lote_com_linha_marcada_com_erro(conn):
+    """A validação da tela é um retrato do banco na pré-visualização; a
+    gravação não pode confiar que ela ainda vale (achado 9)."""
+    rows = [
+        {"titulo": "Bom", "autor": "Autor A", "categoria": "Literária"},
+        {"titulo": "", "autor": "Autor B", "categoria": "Literária"},  # título vazio
+    ]
+    processed, summary = process_import_rows(conn, rows)
+    assert summary["com_erro"] == 1
+
+    with pytest.raises(ValueError, match="erro bloqueante"):
+        app.commit_import(conn, processed)
+    conn.rollback()
+
+    # nada foi gravado, nem a linha boa: carga pela metade é pior que nenhuma
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 0
+
+
+def test_commit_import_aponta_a_linha_e_o_codigo_em_colisao_na_gravacao(conn):
+    """Outra pessoa cadastrou o código entre a pré-visualização e o clique."""
+    rows = [
+        {"titulo": "Livro A", "autor": "Autor A", "categoria": "Literária", "codigo": "XYZ-001"},
+        {"titulo": "Livro B", "autor": "Autor B", "categoria": "Literária", "codigo": "XYZ-002"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+    assert summary["com_erro"] == 0  # na pré-visualização estava tudo certo
+
+    # a corrida: o código da 2ª linha é cadastrado depois da pré-visualização
+    conn.execute(
+        text(
+            "INSERT INTO books (code, title, author, category, status, created_at) "
+            "VALUES ('XYZ-002', 'Chegou antes', 'Outro', 'Literária', 'Disponível', '2026-01-01')"
+        )
+    )
+    conn.commit()
+
+    with pytest.raises(ValueError) as exc:
+        app.commit_import(conn, processed)
+    conn.rollback()
+
+    assert "linha 2" in str(exc.value)
+    assert "XYZ-002" in str(exc.value)
+
+    # transação única: nem a linha 1, que era válida, entrou
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 1
+
+
+def test_commit_import_grava_o_lote_inteiro_quando_esta_tudo_certo(conn):
+    rows = [
+        {"titulo": f"Livro {i}", "autor": f"Autor {i}", "categoria": "Literária"}
+        for i in range(5)
+    ]
+    processed, _ = process_import_rows(conn, rows)
+
+    assert app.commit_import(conn, processed) == 5
+    conn.commit()
+    assert conn.execute(text("SELECT COUNT(*) FROM books")).scalar_one() == 5
+
+
 def test_fluxo_completo_export_externo_mapeado_ate_a_gravacao(conn):
     """Export no estilo Memento: cabeçalhos diferentes, espaços sobrando,
     status em inglês e uma coluna de código legado fora de padrão."""
@@ -1602,7 +1935,15 @@ class _Tela:
         monkeypatch.setattr(app.st, "form", lambda *a, **k: contextlib.nullcontext())
         monkeypatch.setattr(app.st, "expander", lambda *a, **k: contextlib.nullcontext())
         monkeypatch.setattr(app.st, "button", lambda *a, **k: k.get("key") in alvos)
-        monkeypatch.setattr(app.st, "form_submit_button", lambda *a, **k: submits)
+        # submits=True submete todo formulário da tela; um conjunto de rótulos
+        # submete só aqueles (uma tela com dois formulários, como a de login com
+        # a aba de cadastro, precisa distinguir qual foi enviado).
+        if isinstance(submits, bool):
+            _submeteu = lambda label=None, *a, **k: submits  # noqa: E731
+        else:
+            rotulos = set(submits)
+            _submeteu = lambda label=None, *a, **k: label in rotulos  # noqa: E731
+        monkeypatch.setattr(app.st, "form_submit_button", _submeteu)
         monkeypatch.setattr(app.st, "error", lambda m, *a, **k: self.erros.append(str(m)))
         monkeypatch.setattr(app.st, "success", lambda m, *a, **k: self.sucessos.append(str(m)))
         monkeypatch.setattr(app.st, "warning", lambda *a, **k: None)

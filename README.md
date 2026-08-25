@@ -8,9 +8,27 @@ painéis administrativos de empréstimos.
 Stack: **Python + Streamlit + Postgres (Supabase)**, acessado via
 **SQLAlchemy**, tudo em um único arquivo (`app.py`).
 
-> ⚠️ Este é um protótipo para validar as regras de negócio. O hash de senha é
-> básico (SHA-256 + salt) e não há proteção contra força bruta, CSRF etc. —
-> não use como está em produção.
+> ⚠️ Este é um protótipo para validar as regras de negócio, hoje em uso real
+> com o acervo do CCE.
+>
+> **O que já está endurecido:** senhas em **bcrypt** (com migração automática
+> do formato SHA-256 + salt antigo no primeiro login), **bloqueio progressivo
+> por tentativas de login** persistido no banco, sessão invalidada quando um
+> admin redefine a senha, credenciais iniciais vindas dos Secrets (nunca do
+> código), detalhes de exceção desligados no navegador e **tempo de resposta
+> do login equalizado**, para que o relógio não revele se um e-mail existe.
+>
+> **Decisão consciente:** a tela pública de cadastro **informa** quando o
+> e-mail já tem conta, em vez de responder algo neutro. Isso permite enumerar
+> quem é cadastrado — trocamos esse sigilo pela orientação a quem simplesmente
+> esqueceu que já tinha cadastro, que é o caso comum aqui. Se o público do app
+> mudar, essa escolha deve ser reavaliada (o código marca o ponto).
+>
+> **O que continua faltando:** não há proteção dedicada contra CSRF, nem
+> autenticação multifator, nem exclusão/anonimização de leitor (LGPD). O
+> controle de sessão é o do próprio Streamlit. Para um sistema com requisitos
+> mais fortes, a recomendação segue sendo um provedor de autenticação de
+> verdade (NextAuth/Supabase Auth).
 
 ---
 
