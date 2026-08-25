@@ -82,21 +82,19 @@ def _normalize_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", _strip_diacritics(value or "").lower())
 
 
-def generate_book_code(
-    author_full_name: str,
-    existing_count_for_author: int,
-    treat_suffix_as_surname: bool = True,
-) -> str:
-    """
-    [3 primeiras letras do último token do nome, maiúsculas]
-    + [1ª letra do primeiro nome, maiúscula] - [sequencial de 3 dígitos]
+def book_code_prefix(author_full_name: str, treat_suffix_as_surname: bool = True) -> str:
+    """As 4 letras iniciais do código, derivadas só do nome do autor:
+    [3 primeiras letras do último token] + [1ª letra do primeiro nome].
 
-    Ex.: "João Mellão Neto", 1º livro -> "NETJ-001"
+    Ex.: "João Mellão Neto" -> "NETJ"
+
+    É o prefixo, e não a string do autor, que identifica a sequência de
+    numeração. Grafias diferentes da mesma pessoa convergem aqui: tanto
+    "G. K. Chesterton" quanto "Gilbert Keith Chesterton" produzem "CHEG",
+    e por isso compartilham a mesma sequência de sequenciais.
     """
     if not author_full_name or not author_full_name.strip():
         raise ValueError("Nome do autor não pode ser vazio.")
-    if existing_count_for_author < 0:
-        raise ValueError("existing_count_for_author deve ser >= 0.")
 
     parts = author_full_name.strip().split()
     first_name = parts[0]
@@ -112,9 +110,28 @@ def generate_book_code(
     surname_code = surname_code[:3]
 
     first_initial = _only_upper_letters(first_name)[:1] or "X"
-    sequence = str(existing_count_for_author + 1).zfill(3)
 
-    return f"{surname_code}{first_initial}-{sequence}"
+    return f"{surname_code}{first_initial}"
+
+
+def generate_book_code(
+    author_full_name: str,
+    previous_sequence: int,
+    treat_suffix_as_surname: bool = True,
+) -> str:
+    """
+    [prefixo de 4 letras do autor] - [sequencial de 3 dígitos]
+
+    Ex.: "João Mellão Neto", nada emitido ainda -> "NETJ-001"
+
+    `previous_sequence` é o MAIOR sequencial já emitido para o prefixo, não a
+    contagem de livros do autor — ver BookCodeAllocator para o porquê.
+    """
+    prefix = book_code_prefix(author_full_name, treat_suffix_as_surname)
+    if previous_sequence < 0:
+        raise ValueError("previous_sequence deve ser >= 0.")
+
+    return f"{prefix}-{str(previous_sequence + 1).zfill(3)}"
 
 
 # ---------------------------------------------------------------------------
@@ -816,11 +833,36 @@ def get_code_strategy(category: str | None) -> str:
     return CODE_STRATEGY_AUTHOR
 
 
-def count_books_by_author(conn, author: str) -> int:
-    return conn.execute(
-        text("SELECT COUNT(*) AS n FROM books WHERE author = :author"),
-        {"author": author},
-    ).mappings().first()["n"]
+# Código no padrão "PREFIXO-NNN" (ASSM-001, NETJ-1000). Exatamente 4 letras
+# maiúsculas, porque é o que book_code_prefix consegue emitir — um código com
+# outro formato não pertence a nenhuma sequência que este módulo gera.
+# Ancorado nas duas pontas de propósito: os códigos legados do CCE que NÃO
+# seguem o padrão ficam de fora do cálculo do máximo. Ficam de fora, todos
+# corretamente:
+#   BURE, CUNM      -> sem sequencial
+#   Bord-001        -> prefixo fora da caixa alta; não é o BORD de um autor
+#   GOMLI-001       -> 5 letras; não é o GOML de "Lima Gomes"
+#   MILJ-001 (a)    -> sufixo depois do número
+BOOK_CODE_RE = re.compile(r"([A-Z]{4})-(\d+)")
+
+
+def max_sequence_by_prefix(conn) -> dict[str, int]:
+    """Maior sequencial já emitido para CADA prefixo de código, em uma query.
+
+    Uma leitura da coluna `code` inteira devolvendo o mapa completo, em vez de
+    uma consulta por prefixo: o lote da importação tem centenas de prefixos
+    distintos, e uma consulta por linha do arquivo era justamente o N+1 que
+    esta função elimina de passagem.
+    """
+    maxima: dict[str, int] = {}
+    for code in conn.execute(select(books_table.c.code)).scalars():
+        match = BOOK_CODE_RE.fullmatch((code or "").strip())
+        if not match:
+            continue
+        prefix, sequence = match.group(1), int(match.group(2))
+        if sequence > maxima.get(prefix, 0):
+            maxima[prefix] = sequence
+    return maxima
 
 
 def max_numeric_code_for_category(conn, category: str) -> int:
@@ -843,21 +885,77 @@ class BookCodeAllocator:
     acumulando o que já foi alocado nesta instância.
 
     Uma instância por lote: no cadastro manual é um livro só, na importação
-    CSV é o arquivo inteiro — assim o sequencial (por autor ou numérico)
+    CSV é o arquivo inteiro — assim o sequencial (por prefixo ou numérico)
     considera tanto o que já está no banco quanto as linhas anteriores do
     próprio lote.
+
+    As duas estratégias seguem a MESMA regra: o próximo código parte do MAIOR
+    sequencial já emitido naquela sequência, nunca de uma contagem de livros.
+    Contar quebra de duas formas que o acervo real do CCE exibe hoje:
+
+      * o mesmo autor aparece com grafias diferentes ("G. K. Chesterton" e
+        "Gilbert Keith Chesterton"; Dostoiévski aparece com 5 grafias). São
+        strings distintas com o MESMO prefixo, então contar por autor divide
+        a contagem e as duas grafias geram o mesmo sequencial;
+      * a numeração legada tem buracos (Agatha Christie tem 43 livros e
+        sequencial até 44), então a contagem fica abaixo do máximo.
+
+    Nos dois casos o código gerado colidiria com um já existente. Medido
+    contra o acervo real (1.285 livros, 744 autores): 60 autores gerariam
+    hoje um código duplicado pela regra de contagem, e nenhum pela de máximo.
     """
+
+    # Espaços de numeração independentes. 'prefixo' é a regra por autor (as 4
+    # letras); 'numerico' é o sequencial puro do acervo Espiritual.
+    SEQ_PREFIX = "prefixo"
+    SEQ_NUMERIC = "numerico"
 
     def __init__(self, conn):
         self._conn = conn
-        self._author_counts: dict[str, int] = {}
-        self._numeric_max: dict[str, int] = {}
+        # Máximos já gravados no banco, lidos sob demanda e uma vez só.
+        self._prefix_db_max: dict[str, int] | None = None
+        self._numeric_db_max: dict[str, int] = {}
+        # Máximos alocados — ou ocupados por código explícito — neste lote.
+        self._batch_max: dict[tuple[str, str], int] = {}
+
+    def _prefix_base(self, prefix: str) -> int:
+        if self._prefix_db_max is None:
+            self._prefix_db_max = max_sequence_by_prefix(self._conn)
+        return self._prefix_db_max.get(prefix, 0)
 
     def _numeric_base(self, category: str) -> int:
         key = _normalize_key(category)
-        if key not in self._numeric_max:
-            self._numeric_max[key] = max_numeric_code_for_category(self._conn, category)
-        return self._numeric_max[key]
+        if key not in self._numeric_db_max:
+            self._numeric_db_max[key] = max_numeric_code_for_category(self._conn, category)
+        return self._numeric_db_max[key]
+
+    def _next(self, space: str, key: str, db_max: int) -> int:
+        """Próximo número da sequência: um acima do maior entre o que já está
+        no banco e o que este lote já alocou."""
+        sequence = max(db_max, self._batch_max.get((space, key), 0)) + 1
+        self._batch_max[(space, key)] = sequence
+        return sequence
+
+    def _occupy(self, space: str, key: str, sequence: int) -> None:
+        """Marca um número como já usado, para que a próxima geração da mesma
+        sequência não o reemita."""
+        if sequence > self._batch_max.get((space, key), 0):
+            self._batch_max[(space, key)] = sequence
+
+    def _occupy_code_in(self, code_in: str, category: str) -> None:
+        """Um código que veio preenchido na linha não pode ser reemitido
+        adiante no mesmo lote — nem o numérico puro, nem o PREFIXO-NNN.
+
+        O prefixo é lido do PRÓPRIO código, que pode não corresponder ao autor
+        da linha. E código fora de padrão não ocupa nada: um 'BURE' num livro
+        de Machado de Assis não consome um número da sequência ASSM.
+        """
+        if code_in.isdigit():
+            self._occupy(self.SEQ_NUMERIC, _normalize_key(category), int(code_in))
+            return
+        match = BOOK_CODE_RE.fullmatch(code_in)
+        if match:
+            self._occupy(self.SEQ_PREFIX, match.group(1), int(match.group(2)))
 
     def resolve_code(self, author: str, category: str, code_in: str = "") -> str:
         """Código final de uma linha: mantém o que veio preenchido (inclusive
@@ -867,24 +965,19 @@ class BookCodeAllocator:
         author = (author or "").strip()
 
         if code_in:
-            final_code = code_in
-            # um código numérico já ocupado não pode ser reemitido adiante
-            if code_in.isdigit():
-                key = _normalize_key(category)
-                self._numeric_max[key] = max(self._numeric_base(category), int(code_in))
-        elif get_code_strategy(category) == CODE_STRATEGY_NUMERIC:
+            self._occupy_code_in(code_in, category)
+            return code_in
+
+        if get_code_strategy(category) == CODE_STRATEGY_NUMERIC:
             key = _normalize_key(category)
-            final_code = str(self._numeric_base(category) + 1)
-            self._numeric_max[key] = int(final_code)
-        elif author:
-            db_count = count_books_by_author(self._conn, author)
-            final_code = generate_book_code(author, db_count + self._author_counts.get(author, 0))
-        else:
-            final_code = ""
+            return str(self._next(self.SEQ_NUMERIC, key, self._numeric_base(category)))
 
         if author:
-            self._author_counts[author] = self._author_counts.get(author, 0) + 1
-        return final_code
+            prefix = book_code_prefix(author)
+            sequence = self._next(self.SEQ_PREFIX, prefix, self._prefix_base(prefix))
+            return f"{prefix}-{str(sequence).zfill(3)}"
+
+        return ""
 
 
 def add_book(conn, title, author, category):

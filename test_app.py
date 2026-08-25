@@ -1443,6 +1443,203 @@ def test_unicidade_continua_bloqueando_duplicatas_nas_duas_estrategias(conn):
 
 
 # ---------------------------------------------------------------------------
+# Sequencial por PREFIXO (MAX), não por contagem de livros do autor
+# ---------------------------------------------------------------------------
+# Regressão do achado 4 da revisão: derivar o sequencial de COUNT(livros do
+# autor) colide com códigos já existentes em dois cenários que o acervo real
+# do CCE exibe — grafias diferentes do mesmo autor e buracos na numeração
+# legada. Medido contra o acervo real: 60 dos 744 autores gerariam hoje um
+# código duplicado pela regra antiga.
+
+def _insert_legacy_book(conn, code, author, category="Literária"):
+    """Grava um livro com código já definido, como veio da carga do acervo."""
+    conn.execute(
+        text(
+            "INSERT INTO books (code, title, author, category, status, created_at) "
+            "VALUES (:code, :title, :author, :category, 'Disponível', '2020-01-01')"
+        ),
+        {"code": code, "title": f"Livro {code}", "author": author, "category": category},
+    )
+    conn.commit()
+
+
+def test_prefixo_converge_grafias_diferentes_do_mesmo_autor():
+    """A causa raiz nº 1: strings de autor distintas, mesmo prefixo."""
+    assert app.book_code_prefix("G. K. Chesterton") == "CHEG"
+    assert app.book_code_prefix("Gilbert Keith Chesterton") == "CHEG"
+
+    for grafia in [
+        "Fiódor Dostoiévski",
+        "Fiodor Dostoievski",
+        "Fyodor Dostoievsky",
+    ]:
+        assert app.book_code_prefix(grafia).startswith("DOS")
+
+
+def test_grafias_diferentes_do_mesmo_autor_geram_sequenciais_consecutivos(conn):
+    """Antes: as duas grafias contavam separado e as duas geravam CHEG-001."""
+    primeiro = add_book(conn, "Ortodoxia", "G. K. Chesterton", "Literária")
+    conn.commit()
+    segundo = add_book(conn, "O Homem Eterno", "Gilbert Keith Chesterton", "Literária")
+    conn.commit()
+
+    assert primeiro == "CHEG-001"
+    assert segundo == "CHEG-002"  # não CHEG-001 de novo
+    assert primeiro != segundo
+
+
+def test_grafias_diferentes_no_mesmo_lote_de_importacao_nao_colidem(conn):
+    rows = [
+        {"titulo": "Ortodoxia", "autor": "G. K. Chesterton", "categoria": "Literária"},
+        {"titulo": "O Homem Eterno", "autor": "Gilbert Keith Chesterton", "categoria": "Literária"},
+        {"titulo": "Hereges", "autor": "Chesterton", "categoria": "Literária"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    # "Chesterton" sozinho vira CHEC (o token é primeiro nome e sobrenome),
+    # então é uma sequência própria — não colide com as duas grafias completas
+    codigos = [p["codigo"] for p in processed]
+    assert codigos == ["CHEG-001", "CHEG-002", "CHEC-001"]
+    assert len(set(codigos)) == len(codigos)
+    assert summary["com_erro"] == 0
+
+
+def test_sequencial_parte_do_maior_existente_mesmo_com_buraco_na_numeracao(conn):
+    """A causa raiz nº 2: Agatha Christie tem 43 livros e sequencial até 44.
+    Pela contagem o próximo seria CHRA-044, que já existe."""
+    for numero in [1, 2, 44]:  # buraco entre 2 e 44
+        _insert_legacy_book(conn, f"CHRA-{numero:03d}", "Agatha Christie")
+
+    assert count_books(conn) == 3  # contagem (3) muito abaixo do máximo (44)
+    assert add_book(conn, "Assassinato no Expresso", "Agatha Christie", "Literária") == "CHRA-045"
+
+
+def test_codigo_gerado_apos_exclusao_de_livro_do_meio_nao_reemite(conn):
+    """Repro do achado 4: excluir uma duplicata do acervo derrubava a
+    contagem e o próximo cadastro colidia com um código existente."""
+    for _ in range(3):
+        add_book(conn, "Obra", "Machado de Assis", "Literária")
+    conn.commit()
+
+    do_meio = conn.execute(
+        text("SELECT id FROM books WHERE code = 'ASSM-002'")
+    ).scalar_one()
+    delete_book(conn, do_meio)
+    conn.commit()
+
+    # a contagem caiu para 2; a regra antiga geraria ASSM-003, que já existe
+    assert add_book(conn, "Nova Obra", "Machado de Assis", "Literária") == "ASSM-004"
+    conn.commit()
+
+    codigos = conn.execute(text("SELECT code FROM books ORDER BY code")).scalars().all()
+    assert codigos == ["ASSM-001", "ASSM-003", "ASSM-004"]
+    assert len(set(codigos)) == len(codigos)
+
+
+def test_cadastro_apos_exclusao_nao_levanta_integrity_error(conn):
+    """A colisão se manifestava como IntegrityError cru na tela de cadastro."""
+    for _ in range(3):
+        add_book(conn, "Obra", "Clarice Lispector", "Literária")
+    conn.commit()
+    do_meio = conn.execute(text("SELECT id FROM books WHERE code = 'LISC-002'")).scalar_one()
+    delete_book(conn, do_meio)
+    conn.commit()
+
+    add_book(conn, "Nova", "Clarice Lispector", "Literária")
+    conn.commit()  # não levanta IntegrityError
+
+
+@pytest.mark.parametrize(
+    "codigo_legado",
+    ["BURE", "CUNM", "Bord-001", "GOMLI-001", "MILJ-001 (a)", "MILJ-001 (b)"],
+)
+def test_codigos_legados_fora_de_padrao_nao_entram_no_maximo(conn, codigo_legado):
+    """Só PREFIXO-NNN participa da sequência; o resto é preservado mas ignorado."""
+    _insert_legacy_book(conn, codigo_legado, "Autor Legado")
+    assert app.max_sequence_by_prefix(conn) == {}
+
+
+def test_max_sequence_by_prefix_agrupa_por_prefixo_e_ignora_fora_de_padrao(conn):
+    for code in ["ASSM-001", "ASSM-007", "LISC-003", "BURE", "Bord-001",
+                 "GOMLI-001", "MILJ-001 (a)", "461"]:
+        _insert_legacy_book(conn, code, f"Autor {code}")
+
+    assert app.max_sequence_by_prefix(conn) == {"ASSM": 7, "LISC": 3}
+
+
+def test_legado_fora_de_padrao_nao_bloqueia_o_primeiro_codigo_do_prefixo(conn):
+    """'Bord-001' e 'GOMLI-001' se PARECEM com códigos de "Daniel Borba"
+    (BORD) e "Lima Gomes" (GOML), mas não são — caixa e tamanho diferentes.
+    Não podem empurrar essas sequências para 002."""
+    _insert_legacy_book(conn, "Bord-001", "Autor Legado Um")
+    _insert_legacy_book(conn, "GOMLI-001", "Autor Legado Dois")
+
+    assert add_book(conn, "Ficções", "Daniel Borba", "Literária") == "BORD-001"
+    assert add_book(conn, "Sertão", "Lima Gomes", "Literária") == "GOML-001"
+
+
+def test_sequencial_de_4_digitos_e_lido_de_volta_como_maximo(conn):
+    """generate_book_code não trunca acima de 999; o máximo precisa acompanhar."""
+    _insert_legacy_book(conn, "NETJ-1000", "João Mellão Neto")
+    assert app.max_sequence_by_prefix(conn) == {"NETJ": 1000}
+    assert add_book(conn, "Novo", "João Mellão Neto", "Literária") == "NETJ-1001"
+
+
+def test_lote_acumula_sobre_o_maximo_do_banco_com_buraco(conn):
+    """Acúmulo dentro do lote partindo do MÁXIMO, não da contagem."""
+    for numero in [1, 9]:
+        _insert_legacy_book(conn, f"ASSM-{numero:03d}", "Machado de Assis")
+
+    rows = [
+        {"titulo": f"Novo {i}", "autor": "Machado de Assis", "categoria": "Literária"}
+        for i in range(3)
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    assert [p["codigo"] for p in processed] == ["ASSM-010", "ASSM-011", "ASSM-012"]
+    assert summary["com_erro"] == 0
+
+
+def test_codigo_explicito_do_lote_ocupa_o_sequencial_do_prefixo(conn):
+    """Simétrico ao que a estratégia numérica já fazia: um PREFIXO-NNN
+    explícito não pode ser reemitido pela geração seguinte."""
+    allocator = BookCodeAllocator(conn)
+    assert allocator.resolve_code("Machado de Assis", "Literária", "ASSM-050") == "ASSM-050"
+    assert allocator.resolve_code("Machado de Assis", "Literária") == "ASSM-051"
+
+
+def test_codigo_explicito_fora_de_padrao_nao_consome_sequencial(conn):
+    """'BURE' num livro de Machado não gasta um número da sequência ASSM."""
+    allocator = BookCodeAllocator(conn)
+    assert allocator.resolve_code("Machado de Assis", "Literária", "BURE") == "BURE"
+    assert allocator.resolve_code("Machado de Assis", "Literária") == "ASSM-001"
+
+
+def test_acervo_real_sem_colisao_entre_grafias_e_buracos(conn):
+    """Cenário combinado: grafias múltiplas + numeração com buraco + legados,
+    no mesmo lote. Nenhum código repetido, e a gravação passa no UNIQUE."""
+    for code in ["DOSF-001", "DOSF-002", "DOSF-017", "BURE", "Bord-001"]:
+        _insert_legacy_book(conn, code, "Fiódor Dostoiévski")
+
+    rows = [
+        {"titulo": "Crime e Castigo", "autor": "Fiódor Dostoiévski", "categoria": "Literária"},
+        {"titulo": "O Idiota", "autor": "Fiodor Dostoievski", "categoria": "Literária"},
+        {"titulo": "Os Irmãos", "autor": "Fyodor Dostoievsky", "categoria": "Literária"},
+    ]
+    processed, summary = process_import_rows(conn, rows)
+
+    codigos = [p["codigo"] for p in processed]
+    assert codigos == ["DOSF-018", "DOSF-019", "DOSF-020"]
+    assert summary["com_erro"] == 0
+
+    app.commit_import(conn, processed)
+    conn.commit()  # UNIQUE(code) não é violado
+
+    todos = conn.execute(text("SELECT code FROM books")).scalars().all()
+    assert len(todos) == len(set(todos))
+
+
+# ---------------------------------------------------------------------------
 # Busca, filtros e paginação no banco (acervo real tem ~2.552 livros)
 # ---------------------------------------------------------------------------
 

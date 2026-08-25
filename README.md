@@ -286,7 +286,7 @@ livro determina qual regra vale:
 
 | Categoria | Estratégia | Formato | Exemplo |
 |---|---|---|---|
-| **Literária** (e qualquer outra categoria) | por autor | 3 primeiras letras do último token do nome + inicial do primeiro nome + sequencial de 3 dígitos daquele autor | `NETJ-001` |
+| **Literária** (e qualquer outra categoria) | por autor | 3 primeiras letras do último token do nome + inicial do primeiro nome (o **prefixo**) + sequencial de 3 dígitos daquele prefixo (maior sequencial existente + 1) | `NETJ-001` |
 | **Espiritual** | numérica | próximo inteiro livre da sequência da categoria (maior número existente + 1) | `461`, `1091` |
 
 Detalhes:
