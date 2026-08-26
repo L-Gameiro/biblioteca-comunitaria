@@ -25,6 +25,22 @@ import app
 from app import (
     AUDIT_ACTION_PASSWORD_RESET,
     BookCodeAllocator,
+    PAGE_SIZE,
+    SIMPLIFIED_NO_LOGIN_MESSAGE,
+    UNUSABLE_PASSWORD_HASH,
+    borrower_label,
+    convert_simplified_to_full,
+    count_borrowers,
+    count_loan_history,
+    count_overdue_loan_history,
+    create_simplified_reader,
+    display_email,
+    generate_placeholder_email,
+    is_placeholder_email,
+    list_loan_history,
+    list_loan_history_books,
+    list_loan_history_borrowers,
+    loan_history_date_bounds,
     CATEGORY_FILTER_ALL,
     CODE_STRATEGY_AUTHOR,
     CODE_STRATEGY_NUMERIC,
@@ -74,7 +90,7 @@ from app import (
     list_active_loans,
     list_book_categories,
     list_books,
-    list_borrowers,
+    search_borrowers,
     loan_summary_for_books,
     list_unreconciled_books,
     max_numeric_code_for_category,
@@ -1948,7 +1964,12 @@ class _Tela:
         monkeypatch.setattr(app.st, "success", lambda m, *a, **k: self.sucessos.append(str(m)))
         monkeypatch.setattr(app.st, "warning", lambda *a, **k: None)
         monkeypatch.setattr(app.st, "rerun", lambda *a, **k: None)
-        monkeypatch.setattr(app.st, "session_state", session or _SessionStateFake())
+        # `is None`, não `or`: uma sessão vazia é falsy, e trocá-la por outra
+        # faria o teste escrever num estado que ele não consegue mais inspecionar.
+        monkeypatch.setattr(
+            app.st, "session_state",
+            session if session is not None else _SessionStateFake(),
+        )
 
     @property
     def texto(self) -> str:
@@ -3196,9 +3217,9 @@ def test_busca_e_paginacao_da_reconciliacao(acervo_para_reconciliar):
     assert list_unreconciled_books(conn, limit=1, offset=5) == []
 
 
-def test_list_borrowers_traz_somente_leitores(acervo_para_reconciliar):
+def test_search_borrowers_traz_somente_leitores(acervo_para_reconciliar):
     conn, _, _ = acervo_para_reconciliar
-    borrowers = list_borrowers(conn)
+    borrowers = search_borrowers(conn)
     assert [b["email"] for b in borrowers] == ["rec@teste.org"]  # admin fora
 
 
@@ -4290,3 +4311,947 @@ def test_login_bem_sucedido_limpa_o_bloqueio_de_forma_duravel(tmp_path, monkeypa
             text("SELECT COUNT(*) AS n FROM login_attempts WHERE email = 'maria@teste.org'")
         ).mappings().first()["n"]
         assert restantes == 0
+
+
+# ---------------------------------------------------------------------------
+# Empréstimo de balcão e cadastro simplificado (achado 7)
+# ---------------------------------------------------------------------------
+
+def _admin_view(admin_row) -> dict:
+    return {
+        "id": admin_row["id"],
+        "full_name": admin_row["full_name"],
+        "email": admin_row["email"],
+        "role": "admin",
+        "must_change_password": False,
+        "session_version": 0,
+    }
+
+
+@pytest.fixture
+def balcao(conn):
+    """Um admin logado, dois leitores cadastrados e um livro disponível."""
+    create_user(conn, "Admin Balcão", "admin.balcao@teste.org", "", "SenhaAdmin1", "admin")
+    create_user(conn, "Ana Primeira", "ana@teste.org", "111", "senhaAna123", "leitor")
+    create_user(conn, "Bruno Segundo", "bruno@teste.org", "222", "senhaBru123", "leitor")
+    code = add_book(conn, "Grande Sertão", "João Rosa", "Literária")
+    conn.commit()
+    book_id = conn.execute(
+        text("SELECT id FROM books WHERE code = :c"), {"c": code}
+    ).scalar_one()
+    admin = _admin_view(get_user_by_email(conn, "admin.balcao@teste.org"))
+    return conn, book_id, admin
+
+
+def test_admin_registra_emprestimo_de_balcao_para_leitor_cadastrado(balcao, monkeypatch):
+    """7.1: o admin escolhe o leitor no catálogo e o empréstimo sai completo —
+    loan ativo, prazo aplicado e livro fora do catálogo."""
+    conn, book_id, admin = balcao
+    bruno = get_user_by_email(conn, "bruno@teste.org")
+    # o seletor mostra os dois leitores; o admin escolhe o segundo
+    monkeypatch.setattr(app.st, "selectbox", lambda label, options, **k: options[1])
+    tela = _Tela(monkeypatch, botoes={f"admin_borrow_{book_id}"})
+
+    app.show_catalog(conn, admin)
+
+    loan = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :b"), {"b": book_id}
+    ).mappings().first()
+    assert loan is not None
+    assert loan["user_id"] == bruno["id"]
+    assert loan["status"] == "ativo"
+    assert loan["due_date"] == default_due_date().isoformat()
+    assert conn.execute(
+        text("SELECT status FROM books WHERE id = :i"), {"i": book_id}
+    ).scalar_one() == "Emprestado"
+    assert tela.erros == []
+
+
+def test_catalogo_oferece_ao_admin_o_balcao_e_ao_leitor_o_proprio_emprestimo(
+    balcao, monkeypatch
+):
+    """Cada papel vê a sua ação: o admin nunca pega o livro em nome próprio."""
+    conn, book_id, admin = balcao
+    ana = get_user_by_email(conn, "ana@teste.org")
+    leitor_view = {
+        "id": ana["id"], "full_name": ana["full_name"], "email": ana["email"],
+        "role": "leitor", "must_change_password": False, "session_version": 0,
+    }
+
+    oferecidos = []
+    monkeypatch.setattr(
+        app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False
+    )
+    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
+
+    app.show_catalog(conn, admin)
+    assert f"admin_borrow_{book_id}" in oferecidos
+    assert f"borrow_{book_id}" not in oferecidos
+
+    oferecidos.clear()
+    app.show_catalog(conn, leitor_view)
+    assert f"borrow_{book_id}" in oferecidos
+    assert f"admin_borrow_{book_id}" not in oferecidos
+
+
+def test_balcao_nao_aparece_para_livro_indisponivel(balcao, monkeypatch):
+    conn, book_id, admin = balcao
+    conn.execute(text("UPDATE books SET status = 'Emprestado' WHERE id = :i"), {"i": book_id})
+    conn.commit()
+
+    oferecidos = []
+    monkeypatch.setattr(
+        app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False
+    )
+    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
+
+    app.show_catalog(conn, admin)
+
+    assert f"admin_borrow_{book_id}" not in oferecidos
+
+
+def test_balcao_usa_a_trava_de_request_loan_e_mostra_erro_sem_propagar(balcao, monkeypatch):
+    """Mesma trava do leitor: quem perder a corrida vê a mensagem, não um
+    traceback — e nada é gravado."""
+    conn, book_id, admin = balcao
+    monkeypatch.setattr(app.st, "selectbox", lambda label, options, **k: options[0])
+    tela = _Tela(monkeypatch, botoes={f"admin_borrow_{book_id}"})
+    _falha_com(monkeypatch, "request_loan", ValueError("Livro indisponível para empréstimo."))
+
+    app.show_catalog(conn, admin)  # não levanta
+
+    assert "Não foi possível registrar o empréstimo" in tela.texto
+    assert conn.execute(text("SELECT COUNT(*) FROM loans")).scalar_one() == 0
+
+
+def test_balcao_sem_leitor_cadastrado_orienta_em_vez_de_oferecer_seletor(conn, monkeypatch):
+    create_user(conn, "Só Admin", "so.admin@teste.org", "", "SenhaAdmin1", "admin")
+    add_book(conn, "Livro Só", "Autor Só", "Literária")
+    conn.commit()
+    admin = _admin_view(get_user_by_email(conn, "so.admin@teste.org"))
+
+    oferecidos = []
+    monkeypatch.setattr(
+        app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False
+    )
+    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
+
+    app.show_catalog(conn, admin)
+
+    assert not [k for k in oferecidos if k and k.startswith("admin_borrow_")]
+
+
+def test_seletor_de_leitor_busca_por_nome_e_por_email(balcao):
+    conn, _, _ = balcao
+    assert [b["email"] for b in search_borrowers(conn, "ana")] == ["ana@teste.org"]
+    assert [b["email"] for b in search_borrowers(conn, "bruno@teste")] == ["bruno@teste.org"]
+    # sem acento e sem caixa, como o resto do app
+    assert [b["email"] for b in search_borrowers(conn, "BALCÃO")] == []  # admin fora
+    assert search_borrowers(conn, "ana", limit=0) == []
+
+
+def test_seletor_de_leitor_respeita_o_limite_da_pagina(conn):
+    for i in range(app.BORROWER_PICKER_LIMIT + 5):
+        create_user(conn, f"Leitor {i:02d}", f"l{i:02d}@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    assert len(search_borrowers(conn)) == app.BORROWER_PICKER_LIMIT
+    assert count_borrowers(conn) == app.BORROWER_PICKER_LIMIT + 5
+
+
+# --- cadastro simplificado -------------------------------------------------
+
+def test_cadastro_simplificado_com_email_informado(conn):
+    user_id = create_simplified_reader(conn, "  Dona Maria  ", "Dona.Maria@Teste.org", "9999")
+    conn.commit()
+
+    row = conn.execute(
+        text("SELECT * FROM users WHERE id = :i"), {"i": user_id}
+    ).mappings().first()
+    assert row["full_name"] == "Dona Maria"
+    assert row["email"] == "dona.maria@teste.org"   # normalizado
+    assert row["phone"] == "9999"
+    assert row["role"] == "leitor"
+    assert row["is_simplified"] == 1
+    assert row["password_hash"] == UNUSABLE_PASSWORD_HASH
+    assert not is_placeholder_email(row["email"])
+
+
+def test_cadastro_simplificado_sem_email_recebe_placeholder_interno(conn):
+    user_id = create_simplified_reader(conn, "Seu João")
+    conn.commit()
+
+    row = conn.execute(
+        text("SELECT * FROM users WHERE id = :i"), {"i": user_id}
+    ).mappings().first()
+    assert is_placeholder_email(row["email"])
+    # o placeholder nunca chega à tela nem à exportação
+    assert display_email(row["email"]) == ""
+    assert borrower_label(row) == "Seu João (sem e-mail)"
+
+
+@pytest.mark.parametrize(
+    "nome, email, erro",
+    [
+        ("   ", None, "Nome completo é obrigatório."),
+        ("Fulano", "sem-arroba", "E-mail inválido"),
+        ("Fulano", f"x@{app.PLACEHOLDER_EMAIL_DOMAIN}", "domínio de e-mail é reservado"),
+    ],
+)
+def test_cadastro_simplificado_recusa_entrada_invalida(conn, nome, email, erro):
+    with pytest.raises(ValueError, match=erro):
+        create_simplified_reader(conn, nome, email)
+
+
+def test_cadastro_simplificado_recusa_email_ja_usado(conn):
+    create_user(conn, "Já Existe", "ocupado@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
+        create_simplified_reader(conn, "Outro Alguém", "OCUPADO@teste.org")
+
+
+def test_placeholder_de_email_nao_colide_com_um_ja_usado(conn, monkeypatch):
+    """Se o token sorteado repetir um placeholder já em uso, o cadastro sorteia
+    outro — sem tocar no cadastro anterior e sem erro de banco no meio da
+    transação que grava o empréstimo junto."""
+    repetido = f"balcao-repetido@{app.PLACEHOLDER_EMAIL_DOMAIN}"
+    livre = f"balcao-livre@{app.PLACEHOLDER_EMAIL_DOMAIN}"
+
+    monkeypatch.setattr(app, "generate_placeholder_email", lambda: repetido)
+    primeiro = create_simplified_reader(conn, "Primeiro")
+    conn.commit()
+
+    sorteios = iter([repetido, livre])
+    monkeypatch.setattr(app, "generate_placeholder_email", lambda: next(sorteios))
+    segundo = create_simplified_reader(conn, "Segundo")
+    conn.commit()
+
+    assert segundo != primeiro
+    emails = dict(conn.execute(text("SELECT id, email FROM users")).all())
+    assert emails[primeiro] == repetido
+    assert emails[segundo] == livre
+
+
+def test_cadastro_simplificado_traduz_corrida_no_unique_em_mensagem(conn, monkeypatch):
+    """A checagem prévia é UX; quem garante é o UNIQUE. Se o e-mail for tomado
+    entre uma coisa e outra, a tela recebe recusa tratada, não IntegrityError."""
+    def _corrida(*args, **kwargs):
+        raise _integrity_error()
+
+    monkeypatch.setattr(app, "_insert_simplified_reader", _corrida)
+
+    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
+        create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
+    conn.rollback()
+
+
+def test_placeholder_desiste_com_mensagem_se_nunca_encontrar_um_livre(conn, monkeypatch):
+    unico = f"balcao-unico@{app.PLACEHOLDER_EMAIL_DOMAIN}"
+    monkeypatch.setattr(app, "generate_placeholder_email", lambda: unico)
+    create_simplified_reader(conn, "Primeiro")
+    conn.commit()
+
+    with pytest.raises(ValueError, match="identificador interno"):
+        create_simplified_reader(conn, "Segundo")
+
+
+def test_placeholders_gerados_sao_distintos_e_do_dominio_reservado():
+    gerados = {generate_placeholder_email() for _ in range(50)}
+    assert len(gerados) == 50
+    assert all(is_placeholder_email(e) for e in gerados)
+    assert all(is_valid_email(e) for e in gerados)
+
+
+# --- cadastro simplificado não autentica -----------------------------------
+
+def test_login_em_cadastro_simplificado_e_recusado(conn):
+    create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
+    conn.commit()
+
+    assert authenticate(conn, "dona@teste.org", "") is None
+    assert authenticate(conn, "dona@teste.org", UNUSABLE_PASSWORD_HASH) is None
+    assert authenticate(conn, "dona@teste.org", "SenhaQualquer1") is None
+
+
+def test_login_recusado_mesmo_se_a_conta_ganhar_um_hash_valido_por_fora(conn):
+    """A barreira é o is_simplified, não só o hash impossível: uma senha
+    gravada direto no banco continua não abrindo a conta."""
+    user_id = create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
+    conn.execute(
+        text("UPDATE users SET password_hash = :h WHERE id = :i"),
+        {"h": hash_password("SenhaValida1"), "i": user_id},
+    )
+    conn.commit()
+
+    assert authenticate(conn, "dona@teste.org", "SenhaValida1") is None
+
+
+def test_reset_de_senha_e_bloqueado_em_cadastro_simplificado(conn):
+    """Redefinir senha aqui entregaria ao admin uma senha que não abre nada —
+    o caminho certo é converter a conta."""
+    create_user(conn, "Admin R", "admin.r@teste.org", "", "SenhaAdmin1", "admin")
+    user_id = create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
+    conn.commit()
+    admin = get_user_by_email(conn, "admin.r@teste.org")
+
+    with pytest.raises(ValueError, match="não tem acesso ao sistema"):
+        admin_reset_password(conn, admin, user_id)
+    assert SIMPLIFIED_NO_LOGIN_MESSAGE.startswith("Cadastro simplificado")
+    assert list_admin_audit(conn) == []
+
+
+def test_cadastro_simplificado_nao_conta_como_admin_nem_muda_de_papel(conn):
+    """Regras existentes que olham o papel continuam válidas: a conta de
+    balcão é leitor, e a constraint impede que ela vire admin."""
+    create_user(conn, "Admin Único", "admin.u@teste.org", "", "SenhaAdmin1", "admin")
+    user_id = create_simplified_reader(conn, "Dona Maria")
+    conn.commit()
+
+    assert count_admins(conn) == 1
+    with pytest.raises(Exception):
+        conn.execute(
+            text("UPDATE users SET role = 'admin' WHERE id = :i"), {"i": user_id}
+        )
+        conn.commit()
+    conn.rollback()
+
+
+# --- conversão em conta completa -------------------------------------------
+
+def test_conversao_em_conta_completa_preserva_o_historico(conn):
+    user_id = create_simplified_reader(conn, "Dona Maria", phone="1234")
+    code = add_book(conn, "Iracema", "José Alencar", "Literária")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    request_loan(conn, book_id, user_id)
+    conn.commit()
+
+    convert_simplified_to_full(conn, user_id, "Dona.Maria@teste.org", "SenhaNova#1")
+    conn.commit()
+
+    row = conn.execute(text("SELECT * FROM users WHERE id = :i"), {"i": user_id}).mappings().first()
+    assert row["is_simplified"] == 0
+    assert row["email"] == "dona.maria@teste.org"
+    assert row["must_change_password"] == 1
+    assert row["phone"] == "1234"          # telefone antigo preservado
+    # mesmo id, mesmo histórico
+    assert count_loan_history(conn, user_id=user_id) == 1
+    assert list_loan_history(conn, user_id=user_id)[0]["book_id"] == book_id
+    # e agora a conta entra
+    logado = authenticate(conn, "dona.maria@teste.org", "SenhaNova#1")
+    assert logado is not None and logado["id"] == user_id
+
+
+def test_conversao_recusa_senha_fraca_email_invalido_e_email_ocupado(conn):
+    create_user(conn, "Outro", "outro@teste.org", "", "senha1234", "leitor")
+    user_id = create_simplified_reader(conn, "Dona Maria")
+    conn.commit()
+
+    with pytest.raises(ValueError, match="E-mail inválido"):
+        convert_simplified_to_full(conn, user_id, "nao-e-email", "SenhaNova#1")
+    with pytest.raises(ValueError):
+        convert_simplified_to_full(conn, user_id, "dona@teste.org", "curta")
+    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
+        convert_simplified_to_full(conn, user_id, "outro@teste.org", "SenhaNova#1")
+
+    conn.rollback()
+    assert conn.execute(
+        text("SELECT is_simplified FROM users WHERE id = :i"), {"i": user_id}
+    ).scalar_one() == 1
+
+
+def test_conversao_de_conta_que_ja_e_completa_e_recusada(conn):
+    create_user(conn, "Completa", "completa@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+    completa = get_user_by_email(conn, "completa@teste.org")
+
+    with pytest.raises(ValueError, match="já é completa"):
+        convert_simplified_to_full(conn, completa["id"], "nova@teste.org", "SenhaNova#1")
+    with pytest.raises(ValueError, match="Usuário não encontrado."):
+        convert_simplified_to_full(conn, 99999, "nova@teste.org", "SenhaNova#1")
+
+
+def test_tela_de_usuarios_oferece_conversao_e_nao_reset_para_cadastro_de_balcao(
+    conn, monkeypatch
+):
+    create_user(conn, "Admin T", "admin.t@teste.org", "", "SenhaAdmin1", "admin")
+    user_id = create_simplified_reader(conn, "Dona Maria")
+    conn.commit()
+    admin = _admin_view(get_user_by_email(conn, "admin.t@teste.org"))
+
+    oferecidos = []
+    monkeypatch.setattr(
+        app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False
+    )
+    monkeypatch.setattr(app.st, "checkbox", lambda *a, **k: False)
+    monkeypatch.setattr(app.st, "expander", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(app.st, "form", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(app.st, "form_submit_button", lambda *a, **k: False)
+    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
+
+    app.show_user_management(conn, admin)
+
+    assert f"convert_{user_id}" in oferecidos
+    assert f"reset_{user_id}" not in oferecidos
+
+
+def test_tela_de_usuarios_converte_o_cadastro_de_balcao(conn, monkeypatch):
+    create_user(conn, "Admin T", "admin.t2@teste.org", "", "SenhaAdmin1", "admin")
+    user_id = create_simplified_reader(conn, "Dona Maria")
+    conn.commit()
+    admin = _admin_view(get_user_by_email(conn, "admin.t2@teste.org"))
+
+    campos = {"E-mail de acesso": "dona@teste.org", "Senha provisória": "SenhaNova#1"}
+    monkeypatch.setattr(
+        app.st, "text_input", lambda label, *a, **k: campos.get(label, k.get("value", ""))
+    )
+    monkeypatch.setattr(app.st, "checkbox", lambda *a, **k: False)
+    tela = _Tela(monkeypatch, botoes={f"convert_{user_id}"})
+
+    app.show_user_management(conn, admin)
+
+    assert tela.erros == []
+    assert authenticate(conn, "dona@teste.org", "SenhaNova#1") is not None
+
+
+# --- reconciliação com cadastro de balcão ----------------------------------
+
+def test_reconciliacao_cria_cadastro_simplificado_e_registra_o_emprestimo(
+    acervo_para_reconciliar, monkeypatch
+):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    campos = {
+        "Nome completo do leitor": "Vizinha do 302",
+        "E-mail (opcional)": "",
+        "Telefone (opcional)": "988887777",
+    }
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
+    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
+
+    app.show_loan_reconciliation(conn)
+
+    assert tela.erros == []
+    novo = conn.execute(
+        text("SELECT * FROM users WHERE full_name = 'Vizinha do 302'")
+    ).mappings().first()
+    assert novo["is_simplified"] == 1
+    assert novo["phone"] == "988887777"
+    assert is_placeholder_email(novo["email"])
+
+    loan = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :b"), {"b": book["id"]}
+    ).mappings().first()
+    assert loan["user_id"] == novo["id"]
+    assert loan["status"] == "ativo"
+    # o livro segue fisicamente com a pessoa
+    assert conn.execute(
+        text("SELECT status FROM books WHERE id = :i"), {"i": book["id"]}
+    ).scalar_one() == "Emprestado"
+
+
+def test_reconciliacao_com_email_informado_permite_converter_depois(
+    acervo_para_reconciliar, monkeypatch
+):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    campos = {
+        "Nome completo do leitor": "Vizinho do 101",
+        "E-mail (opcional)": "vizinho@teste.org",
+        "Telefone (opcional)": "",
+    }
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
+    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
+
+    app.show_loan_reconciliation(conn)
+
+    assert tela.erros == []
+    novo = get_user_by_email(conn, "vizinho@teste.org")
+    assert novo["is_simplified"] == 1
+    assert authenticate(conn, "vizinho@teste.org", "qualquer") is None
+
+
+def test_reconciliacao_nao_deixa_cadastro_orfao_se_o_emprestimo_falhar(
+    acervo_para_reconciliar, monkeypatch
+):
+    """Cadastro e empréstimo saem na mesma transação: se outra sessão
+    reconciliou o livro no meio do caminho, o rollback leva os dois."""
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    campos = {"Nome completo do leitor": "Fantasma", "E-mail (opcional)": "",
+              "Telefone (opcional)": ""}
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
+    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
+    _falha_com(
+        monkeypatch, "reconcile_register_loan", ValueError("Outra pessoa já o reconciliou.")
+    )
+
+    app.show_loan_reconciliation(conn)  # não levanta
+
+    assert "reconciliou" in tela.texto
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM users WHERE full_name = 'Fantasma'")
+    ).scalar_one() == 0
+
+
+def test_reconciliacao_recusa_cadastro_sem_nome(acervo_para_reconciliar, monkeypatch):
+    conn, codes, _ = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Um"])
+
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: "")
+    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
+
+    app.show_loan_reconciliation(conn)
+
+    assert "Nome completo é obrigatório." in tela.texto
+    assert conn.execute(text("SELECT COUNT(*) FROM loans WHERE book_id = :b"),
+                        {"b": book["id"]}).scalar_one() == 0
+
+
+def test_reconciliacao_continua_registrando_para_leitor_ja_cadastrado(
+    acervo_para_reconciliar, monkeypatch
+):
+    conn, codes, leitor = acervo_para_reconciliar
+    book = _book_by_code(conn, codes["Pendente Dois"])
+
+    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: "")
+    monkeypatch.setattr(app.st, "selectbox", lambda label, options, **k: options[0])
+    tela = _Tela(monkeypatch, botoes={f"rec_confirm_{book['id']}"})
+
+    app.show_loan_reconciliation(conn)
+
+    assert tela.erros == []
+    loan = conn.execute(
+        text("SELECT * FROM loans WHERE book_id = :b"), {"b": book["id"]}
+    ).mappings().first()
+    assert loan["user_id"] == leitor["id"]
+
+
+# ---------------------------------------------------------------------------
+# Histórico de empréstimos: filtro e paginação em SQL (achado 12)
+# ---------------------------------------------------------------------------
+
+def _insert_loan(conn, book_id, user_id, loan_date, due_date=None,
+                 return_date=None, status="ativo"):
+    """Empréstimo com data controlada — request_loan sempre grava 'agora'."""
+    conn.execute(
+        text(
+            """INSERT INTO loans (book_id, user_id, loan_date, due_date, return_date, status)
+               VALUES (:b, :u, :loan, :due, :ret, :st)"""
+        ),
+        {"b": book_id, "u": user_id, "loan": loan_date, "due": due_date,
+         "ret": return_date, "st": status},
+    )
+
+
+def _apaga_leitor_por_fora(conn, user_id) -> None:
+    """Apaga o leitor contornando a FK, simulando a remoção fora do app — é o
+    único jeito de um empréstimo ficar órfão (ver o mesmo recurso em
+    test_export_loans_csv_nao_vaza_dados_de_leitor_removido)."""
+    conn.commit()
+    conn.execute(text("PRAGMA foreign_keys = OFF"))
+    conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": user_id})
+    conn.commit()
+    conn.execute(text("PRAGMA foreign_keys = ON"))
+
+
+@pytest.fixture
+def historico(conn):
+    """Dois leitores, três livros e empréstimos espalhados no tempo."""
+    create_user(conn, "Ana Leitora", "ana.h@teste.org", "111", "senha1234", "leitor")
+    create_user(conn, "Bruno Leitor", "bruno.h@teste.org", "222", "senha1234", "leitor")
+    codes = {
+        titulo: add_book(conn, titulo, autor, "Literária")
+        for titulo, autor in [
+            ("Alfa", "Autor Alfa"),
+            ("Beta", "Autor Beta"),
+            ("Gama", "Autor Gama"),
+        ]
+    }
+    conn.commit()
+    ids = {
+        titulo: conn.execute(
+            text("SELECT id FROM books WHERE code = :c"), {"c": code}
+        ).scalar_one()
+        for titulo, code in codes.items()
+    }
+    ana = get_user_by_email(conn, "ana.h@teste.org")
+    bruno = get_user_by_email(conn, "bruno.h@teste.org")
+
+    # Ana: Alfa (2026-01-10, devolvido) e Beta (2026-03-05, ativo e atrasado)
+    _insert_loan(conn, ids["Alfa"], ana["id"], "2026-01-10T09:00:00",
+                 "2026-01-24", "2026-01-20T10:00:00", "devolvido")
+    _insert_loan(conn, ids["Beta"], ana["id"], "2026-03-05T14:30:00", "2026-03-19")
+    # Bruno: Gama (2026-06-20, ativo, no prazo até 2026-12-31)
+    _insert_loan(conn, ids["Gama"], bruno["id"], "2026-06-20", "2026-12-31")
+    conn.commit()
+    return conn, ids, ana, bruno
+
+
+def test_historico_conta_e_lista_tudo_sem_filtro(historico):
+    conn, ids, _, _ = historico
+    assert count_loan_history(conn) == 3
+    rows = list_loan_history(conn)
+    # do mais recente para o mais antigo
+    assert [r["book_title"] for r in rows] == ["Gama", "Beta", "Alfa"]
+    assert rows[0]["full_name"] == "Bruno Leitor"
+
+
+def test_historico_filtra_por_livro_no_sql(historico):
+    conn, ids, _, _ = historico
+    assert count_loan_history(conn, book_id=ids["Beta"]) == 1
+    rows = list_loan_history(conn, book_id=ids["Beta"])
+    assert [r["book_title"] for r in rows] == ["Beta"]
+
+
+def test_historico_filtra_por_leitor_no_sql(historico):
+    conn, _, ana, bruno = historico
+    assert count_loan_history(conn, user_id=ana["id"]) == 2
+    assert count_loan_history(conn, user_id=bruno["id"]) == 1
+    assert all(r["full_name"] == "Ana Leitora"
+               for r in list_loan_history(conn, user_id=ana["id"]))
+
+
+def test_historico_filtra_por_periodo_incluindo_os_dois_extremos(historico):
+    conn, _, _, _ = historico
+    # o dia final entra inteiro, mesmo com hora gravada no loan_date
+    assert count_loan_history(conn, start=date(2026, 1, 10), end=date(2026, 3, 5)) == 2
+    assert count_loan_history(conn, start=date(2026, 3, 5), end=date(2026, 3, 5)) == 1
+    assert count_loan_history(conn, start=date(2026, 3, 6), end=date(2026, 6, 19)) == 0
+    # empréstimo gravado só com a data (reconciliação) também entra
+    assert count_loan_history(conn, start=date(2026, 6, 20), end=date(2026, 6, 20)) == 1
+
+
+def test_historico_combina_filtros(historico):
+    conn, ids, ana, _ = historico
+    assert count_loan_history(
+        conn, user_id=ana["id"], book_id=ids["Alfa"],
+        start=date(2026, 1, 1), end=date(2026, 12, 31),
+    ) == 1
+    assert count_loan_history(
+        conn, user_id=ana["id"], book_id=ids["Gama"],
+    ) == 0
+
+
+def test_historico_pagina_no_sql_sem_repetir_nem_pular_linha(historico):
+    conn, ids, ana, _ = historico
+    # mesma data em dois empréstimos: o desempate por id mantém a ordem estável
+    _insert_loan(conn, ids["Alfa"], ana["id"], "2026-06-20", "2026-07-04")
+    conn.commit()
+
+    vistos = []
+    for offset in range(0, count_loan_history(conn), 2):
+        pagina = list_loan_history(conn, limit=2, offset=offset)
+        assert len(pagina) <= 2
+        vistos.extend(r["loan_id"] for r in pagina)
+
+    assert len(vistos) == 4
+    assert len(set(vistos)) == 4
+    assert list_loan_history(conn, limit=2, offset=10) == []
+
+
+def test_historico_conta_atrasados_no_sql_respeitando_o_filtro(historico):
+    conn, _, ana, bruno = historico
+    referencia = date(2026, 6, 30)
+    # Beta venceu em 19/03 e continua ativo; Gama vence só em 31/12
+    assert count_overdue_loan_history(conn, reference_date=referencia) == 1
+    assert count_overdue_loan_history(
+        conn, reference_date=referencia, user_id=ana["id"]
+    ) == 1
+    assert count_overdue_loan_history(
+        conn, reference_date=referencia, user_id=bruno["id"]
+    ) == 0
+    # vencer exatamente hoje ainda não é atraso, como em is_overdue
+    assert count_overdue_loan_history(conn, reference_date=date(2026, 3, 19)) == 0
+    assert count_overdue_loan_history(conn, reference_date=date(2026, 3, 20)) == 1
+
+
+def test_historico_ignora_atraso_de_emprestimo_devolvido_ou_sem_prazo(historico):
+    conn, ids, ana, _ = historico
+    _insert_loan(conn, ids["Alfa"], ana["id"], "2026-02-01", None)  # ativo, sem prazo
+    conn.commit()
+    # em 01/01/2027 Beta e Gama estão vencidos; o devolvido e o sem prazo, não
+    assert count_overdue_loan_history(conn, reference_date=date(2027, 1, 1)) == 2
+
+
+def test_listas_dos_filtros_sao_consultas_proprias_e_pequenas(historico):
+    conn, ids, _, _ = historico
+    add_book(conn, "Nunca Emprestado", "Autor Zeta", "Literária")
+    create_user(conn, "Nunca Pegou", "nunca@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+
+    livros = list_loan_history_books(conn)
+    assert [b["title"] for b in livros] == ["Alfa", "Beta", "Gama"]
+    assert set(livros[0].keys()) == {"id", "title", "code"}
+
+    leitores = list_loan_history_borrowers(conn)
+    assert [u["full_name"] for u in leitores] == ["Ana Leitora", "Bruno Leitor"]
+    assert set(leitores[0].keys()) == {"id", "full_name", "email"}
+
+
+def test_limites_de_data_vem_de_agregados_no_banco(historico, conn):
+    primeiro, ultimo = loan_history_date_bounds(conn)
+    assert primeiro == date(2026, 1, 10)
+    assert ultimo == date(2026, 6, 20)
+
+
+def test_limites_de_data_sem_emprestimo_nenhum(conn):
+    assert loan_history_date_bounds(conn) == (None, None)
+
+
+def test_historico_preserva_a_linha_de_leitor_removido_sem_expor_dados(historico):
+    """Anonimização: LEFT JOIN, como na exportação. O empréstimo continua no
+    histórico como "Leitor removido" — some do seletor de filtro, não da
+    listagem nem da contagem."""
+    conn, _, ana, _ = historico
+    _apaga_leitor_por_fora(conn, ana["id"])
+
+    assert count_loan_history(conn) == 3
+    rows = list_loan_history(conn)
+    orfaos = [r for r in rows if r["full_name"] is None]
+    assert len(orfaos) == 2
+    for r in orfaos:
+        assert r["email"] is None
+        assert r["phone"] is None
+        assert app._history_borrower_name(r) == app.ANONYMIZED_BORROWER_LABEL
+
+    assert [u["full_name"] for u in list_loan_history_borrowers(conn)] == ["Bruno Leitor"]
+    # e o filtro por aquele leitor continua funcionando pelo id do empréstimo
+    assert count_loan_history(conn, user_id=ana["id"]) == 2
+
+
+def test_historico_nao_mostra_o_email_interno_do_cadastro_de_balcao(conn):
+    user_id = create_simplified_reader(conn, "Dona Maria")
+    code = add_book(conn, "Iracema", "José Alencar", "Literária")
+    conn.commit()
+    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
+    _insert_loan(conn, book_id, user_id, "2026-05-01", "2026-05-15")
+    conn.commit()
+
+    row = list_loan_history(conn)[0]
+    assert row["full_name"] == "Dona Maria"
+    assert display_email(row["email"]) == ""
+    assert borrower_label(list_loan_history_borrowers(conn)[0]) == "Dona Maria (sem e-mail)"
+
+
+# --- a tela ----------------------------------------------------------------
+
+class _ColunaFake:
+    """st.columns devolve contêineres com os mesmos métodos de st; fora do
+    runtime eles não passam pelos monkeypatches. Este delega tudo de volta
+    para app.st, para que a tela use os widgets que o teste substituiu."""
+
+    def __getattr__(self, name):
+        return getattr(app.st, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _tela_historico(monkeypatch, session=None, escolhas=None):
+    """Roda show_admin_loan_history capturando o que iria para a tabela."""
+    capturado = []
+    monkeypatch.setattr(app.st, "dataframe", lambda dados, *a, **k: capturado.append(dados))
+    monkeypatch.setattr(
+        app.st,
+        "columns",
+        lambda spec, **k: [
+            _ColunaFake() for _ in range(spec if isinstance(spec, int) else len(spec))
+        ],
+    )
+    escolhas = escolhas or {}
+    monkeypatch.setattr(
+        app.st, "selectbox", lambda label, options, **k: escolhas.get(label, options[0])
+    )
+    _Tela(monkeypatch, session=session if session is not None else _SessionStateFake())
+    return capturado
+
+
+def test_tela_do_historico_carrega_uma_pagina_por_vez(conn, monkeypatch):
+    """O ponto do achado 12: a tela não traz mais o histórico inteiro para a
+    memória — vem PAGE_SIZE linhas, e a contagem total vem do banco."""
+    create_user(conn, "Ana Leitora", "ana.p@teste.org", "", "senha1234", "leitor")
+    conn.commit()
+    ana = get_user_by_email(conn, "ana.p@teste.org")
+    total = PAGE_SIZE + 5
+    for i in range(total):
+        code = add_book(conn, f"Livro {i:02d}", "Autor Único", "Literária")
+        book_id = conn.execute(
+            text("SELECT id FROM books WHERE code = :c"), {"c": code}
+        ).scalar_one()
+        _insert_loan(conn, book_id, ana["id"], f"2026-01-{i + 1:02d}", "2026-12-31")
+    conn.commit()
+
+    sessao = _SessionStateFake()
+    capturado = _tela_historico(monkeypatch, session=sessao)
+    app.show_admin_loan_history(conn)
+    assert len(capturado[0]) == PAGE_SIZE
+
+    # segunda página: só o resto, sem repetir a primeira. Mesma sessão, mesmos
+    # filtros — só o clique em "Próxima".
+    sessao["history_page"] = 2
+    capturado2 = _tela_historico(monkeypatch, session=sessao)
+    app.show_admin_loan_history(conn)
+    assert len(capturado2[0]) == total - PAGE_SIZE
+    primeiros = {linha["Livro"] for linha in capturado[0]}
+    segundos = {linha["Livro"] for linha in capturado2[0]}
+    assert primeiros.isdisjoint(segundos)
+
+
+def test_tela_do_historico_filtra_por_leitor_escolhido(historico, monkeypatch):
+    conn, _, _, _ = historico
+    capturado = _tela_historico(
+        monkeypatch, escolhas={"Filtrar por usuário": "Bruno Leitor (bruno.h@teste.org)"}
+    )
+
+    app.show_admin_loan_history(conn)
+
+    assert [linha["Leitor"] for linha in capturado[0]] == ["Bruno Leitor"]
+
+
+def test_tela_do_historico_volta_para_a_primeira_pagina_quando_o_filtro_muda(
+    historico, monkeypatch
+):
+    conn, _, _, _ = historico
+    sessao = _SessionStateFake({
+        "history_page": 3,
+        "history_filter_signature": ("outro", "outro", "x", "y"),
+    })
+    _tela_historico(monkeypatch, session=sessao)
+
+    app.show_admin_loan_history(conn)
+
+    assert sessao["history_page"] == 1
+
+
+def test_tela_do_historico_sem_emprestimo_nenhum(conn, monkeypatch):
+    capturado = _tela_historico(monkeypatch)
+    app.show_admin_loan_history(conn)  # não levanta
+    assert capturado == []
+
+
+def test_tela_do_historico_mostra_leitor_removido(historico, monkeypatch):
+    conn, _, ana, _ = historico
+    _apaga_leitor_por_fora(conn, ana["id"])
+
+    capturado = _tela_historico(monkeypatch)
+    app.show_admin_loan_history(conn)
+
+    linhas = capturado[0]
+    removidas = [l for l in linhas if l["Leitor"] == app.ANONYMIZED_BORROWER_LABEL]
+    assert len(removidas) == 2
+    assert all(l["E-mail"] == "-" and l["Telefone"] == "-" for l in removidas)
+
+
+def test_emprestimo_de_balcao_ponta_a_ponta_pela_tela_real(tmp_path, monkeypatch):
+    """Integração pelo runtime do Streamlit: o admin loga, abre o Catálogo e
+    registra o empréstimo em nome de um leitor. Cobre o que o teste com
+    widgets substituídos não alcança — o popover e o botão de verdade."""
+    from streamlit.testing.v1 import AppTest
+
+    database_url = f"sqlite:///{tmp_path}/balcao_ui.db"
+    monkeypatch.setattr(app.st, "secrets", _secrets(DATABASE_URL=database_url))
+    create_schema(get_engine(database_url))
+    with get_connection(database_url) as connection:
+        create_user(connection, "Ana Leitora", "ana.ui@teste.org", "", "senha1234", "leitor")
+        code = add_book(connection, "Dom Casmurro", "Machado de Assis", "Literária")
+        connection.commit()
+        book_id = connection.execute(
+            text("SELECT id FROM books WHERE code = :c"), {"c": code}
+        ).scalar_one()
+        ana = get_user_by_email(connection, "ana.ui@teste.org")
+
+    at = AppTest.from_file("app.py", default_timeout=30)
+    at.secrets.update(_secrets(DATABASE_URL=database_url))
+    at.run()
+    _login_as_admin_and_complete_forced_password_change(at)
+
+    at.radio[0].set_value("Catálogo").run()
+    assert not at.exception, at.exception
+    chaves = [b.key for b in at.button]
+    assert f"admin_borrow_{book_id}" in chaves
+    assert f"borrow_{book_id}" not in chaves      # admin não pega para si
+
+    at.button(key=f"admin_borrow_{book_id}").click().run()
+    assert not at.exception, at.exception
+
+    with get_connection(database_url) as connection:
+        loan = connection.execute(
+            text("SELECT * FROM loans WHERE book_id = :b"), {"b": book_id}
+        ).mappings().first()
+        assert loan is not None
+        assert loan["user_id"] == ana["id"]
+        assert connection.execute(
+            text("SELECT status FROM books WHERE id = :i"), {"i": book_id}
+        ).scalar_one() == "Emprestado"
+
+
+def test_migracao_adiciona_is_simplified_sem_mexer_em_quem_ja_existe(
+    tmp_path, bootstrap_secrets
+):
+    """Banco criado antes do cadastro de balcão: a coluna entra com 0, então
+    toda conta existente continua sendo conta completa e continua logando."""
+    import sqlite3
+
+    db_path = tmp_path / "legado_simplificado.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL, role TEXT NOT NULL,
+          must_change_password INTEGER NOT NULL DEFAULT 0,
+          session_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        """
+    )
+    raw.execute(
+        "INSERT INTO users VALUES (1,'Maria','maria@x.org','',?,'','leitor',0,0,'2026-01-01')",
+        (hash_password("SenhaAntiga1"),),
+    )
+    raw.commit()
+    raw.close()
+
+    database_url = f"sqlite:///{db_path}"
+    create_schema(get_engine(database_url))  # dispara a migração
+
+    with get_connection(database_url) as connection:
+        maria = get_user_by_email(connection, "maria@x.org")
+        assert maria["is_simplified"] == 0
+        assert authenticate(connection, "maria@x.org", "SenhaAntiga1") is not None
+
+
+def test_catalogo_do_admin_nao_faz_uma_busca_de_leitor_por_livro(conn, monkeypatch):
+    """O corpo do popover roda a cada rerun, aberto ou não: sem memória por
+    render, uma página de 25 livros viraria 25 buscas de leitor."""
+    create_user(conn, "Admin N", "admin.n@teste.org", "", "SenhaAdmin1", "admin")
+    create_user(conn, "Ana Leitora", "ana.n@teste.org", "", "senha1234", "leitor")
+    for i in range(PAGE_SIZE):
+        add_book(conn, f"Livro {i:02d}", "Autor Repetido", "Literária")
+    conn.commit()
+    admin = _admin_view(get_user_by_email(conn, "admin.n@teste.org"))
+
+    buscas = []
+    real_search = app.search_borrowers
+    monkeypatch.setattr(
+        app, "search_borrowers",
+        lambda c, q="", **k: (buscas.append(q), real_search(c, q, **k))[1],
+    )
+    contagens = []
+    real_count = app.count_borrowers
+    monkeypatch.setattr(
+        app, "count_borrowers",
+        lambda c, q="": (contagens.append(q), real_count(c, q))[1],
+    )
+    _Tela(monkeypatch)
+
+    app.show_catalog(conn, admin)
+
+    assert len(buscas) == 1      # um termo distinto, uma consulta
+    assert len(contagens) == 1

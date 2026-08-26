@@ -528,6 +528,10 @@ Os arquivos saem em **UTF-8 com BOM** e com **todos os campos entre aspas**
 corrompidos e as aspas impedem que um título contendo `,` ou `;` quebre as
 colunas.
 
+> **Cadastros de balcão:** contas sem e-mail informado saem com o campo
+> e-mail vazio na exportação — o endereço interno gerado pelo sistema nunca é
+> exportado como se fosse contato da pessoa.
+
 > **Leitores removidos:** o sistema não tem (ainda) remoção nem anonimização
 > de leitores. A exportação do histórico usa `LEFT JOIN` como proteção: se um
 > empréstimo ficar órfão (usuário apagado direto no banco), a linha é
@@ -538,11 +542,83 @@ colunas.
 
 - **Empréstimos ativos**: cada linha mostra também o e-mail e telefone do
   leitor responsável, além do nome, para facilitar o contato.
-- **Histórico completo** (admin): lista todos os empréstimos — ativos e
-  devolvidos, de todos os usuários e livros — com filtros por livro, por
-  usuário e por período (data de empréstimo). Ao selecionar um usuário
-  específico no filtro, um painel abaixo mostra todo o histórico daquele
-  usuário (livro, datas de empréstimo/devolução e status).
+- **Histórico completo** (admin): todos os empréstimos — ativos e devolvidos,
+  de todos os usuários e livros — com filtros por livro, por usuário e por
+  período (data de empréstimo) e **paginação de 25 itens**.
+
+  Filtros, contagem total, contagem de atrasados e paginação são resolvidos
+  **no banco** (`WHERE` + `LIMIT`/`OFFSET`), como no Catálogo: a tela nunca
+  carrega o histórico inteiro em memória. Isso importa mais aqui do que nas
+  outras telas porque esta é a que reúne mais dado pessoal de uma vez (nome,
+  e-mail e telefone de cada leitor). As listas dos seletores de filtro são
+  consultas próprias e pequenas — os livros e os leitores que aparecem no
+  histórico, sem trazer empréstimo nenhum junto. Trocar qualquer filtro volta
+  para a primeira página.
+
+  Ao selecionar um usuário no filtro, um painel abaixo mostra os empréstimos
+  mais recentes daquele usuário (até 25), ignorando os filtros de livro e
+  período — é a pergunta "o que mais está com essa pessoa?".
+
+  Empréstimo órfão (leitor apagado direto no banco) continua na listagem como
+  `Leitor removido`, sem e-mail nem telefone: a consulta usa `LEFT JOIN`, como
+  a exportação em CSV.
+
+## Empréstimo de balcão e cadastro simplificado
+
+Numa biblioteca comunitária o fluxo principal é presencial: a pessoa chega no
+balcão, escolhe o livro e leva. Boa parte do público não vai criar conta e
+operar o app sozinho — e o acervo já veio com centenas de livros emprestados a
+pessoas que não existem no sistema.
+
+**No Catálogo, o admin tem "Registrar empréstimo para…"** em todo livro
+`Disponível` (o leitor logado continua vendo "Pegar emprestado", para si
+mesmo). O admin busca o leitor por nome ou e-mail, confirma a data prevista de
+devolução (prazo padrão pré-preenchido) e o empréstimo é criado pelo **mesmo
+`request_loan`** do leitor — inclusive a trava por `UPDATE ... WHERE status =
+'Disponível'`, que impede dois atendimentos simultâneos do mesmo exemplar. O
+seletor mostra no máximo 20 leitores por busca, e avisa quando há mais.
+
+Isso substitui o contorno anterior (editar o status do livro para `Emprestado`
+na Gestão de Livros e depois usar a Reconciliação), que passava por duas telas
+e quebrava o invariante livro↔empréstimo no meio do caminho.
+
+### Cadastro simplificado (conta de balcão)
+
+Para quem não tem cadastro, a tela **Reconciliação** permite criar o leitor no
+mesmo fluxo, dentro de "📝 Registrar empréstimo": nome (obrigatório), e-mail e
+telefone (opcionais). O cadastro e o empréstimo são gravados **na mesma
+transação** — se a reconciliação falhar porque outro admin agiu antes, o
+rollback leva junto o cadastro recém-criado, sem deixar leitor fantasma.
+
+O que a conta de balcão é e não é:
+
+| | |
+|---|---|
+| **É** | um leitor (`role = 'leitor'`, `is_simplified = 1`) que existe para dizer **quem está com o livro** — aparece nos seletores, no histórico e nos empréstimos ativos como qualquer outro. |
+| **Não é** | um acesso ao sistema: não tem senha utilizável e o login recusa a conta explicitamente, mesmo que uma senha válida seja gravada por outro caminho. |
+| **Não é** | um perfil novo no RBAC: como continua `leitor`, todas as regras que olham o papel seguem valendo sem conhecer este conceito. Uma constraint impede que um cadastro de balcão vire admin. |
+
+**E-mail opcional.** `users.email` é `NOT NULL UNIQUE` (é ele que identifica a
+conta no login), então quem não informa e-mail recebe um endereço interno em um
+domínio reservado (`@cadastro-simplificado.invalid`, da RFC 2606 — nunca vai
+existir de verdade). Esse placeholder **nunca aparece na tela nem na
+exportação**: onde ele existe, o app mostra "sem e-mail" ou campo vazio.
+
+**Redefinir senha é bloqueado** para essas contas: entregaria ao admin uma
+senha temporária que não abre nada. O caminho é converter.
+
+### Convertendo em conta completa
+
+Em **Gestão de Usuários**, um cadastro de balcão (ícone 🪪) oferece "Dar acesso
+ao sistema" no lugar de "Redefinir senha": informe o e-mail de acesso e uma
+senha provisória. A conversão **mantém o mesmo `users.id`**, então todo o
+histórico de empréstimos da pessoa continua ligado a ela — é a mesma conta
+ganhando login, não um cadastro novo. A troca de senha é obrigatória no
+primeiro acesso, como no cadastro de administrador.
+
+> Se a pessoa tentar se cadastrar sozinha com um e-mail que já está num
+> cadastro de balcão, a tela de cadastro responde que o e-mail já existe e
+> orienta a procurar um admin — que faz a conversão, preservando o histórico.
 
 ## Reconciliação de empréstimos
 
@@ -559,7 +635,7 @@ paginação de 25 itens. Para cada livro, duas ações:
 
 | Ação | O que faz |
 |---|---|
-| **📝 Registrar empréstimo** | Escolhe um leitor cadastrado, a data do empréstimo e a devolução prevista (prazo padrão pré-preenchido), e cria o empréstimo ativo que faltava. O livro **continua `Emprestado`** — ele segue fisicamente com o leitor; o que muda é que agora existe registro de quem está com ele, e ele passa a aparecer em "Empréstimos ativos". |
+| **📝 Registrar empréstimo** | Escolhe um leitor já cadastrado (por busca) **ou cria o cadastro de balcão na hora**, define a data do empréstimo e a devolução prevista (prazo padrão pré-preenchido), e cria o empréstimo ativo que faltava. O livro **continua `Emprestado`** — ele segue fisicamente com o leitor; o que muda é que agora existe registro de quem está com ele, e ele passa a aparecer em "Empréstimos ativos". |
 | **✅ Marcar como devolvido** | O livro já voltou fisicamente: muda o status para `Disponível` e **não cria registro de empréstimo** (não sabemos quem estava com ele, e inventar histórico seria pior que não ter). |
 
 As duas ações rodam em transação e **revalidam o estado do livro no momento da

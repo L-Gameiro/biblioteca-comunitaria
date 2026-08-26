@@ -161,9 +161,21 @@ users_table = Table(
     # (ver _session_is_current): a sessão que ficou aberta em outra aba com a
     # senha antiga cai no próximo clique, em vez de continuar valendo.
     Column("session_version", Integer, nullable=False, server_default="0"),
+    # Cadastro simplificado: leitor criado pelo balcão, para registrar o
+    # empréstimo de quem não tem (ou não quer) conta. Não tem senha utilizável
+    # e nunca autentica — ver authenticate() e UNUSABLE_PASSWORD_HASH. Vira
+    # conta completa por convert_simplified_to_full, preservando o histórico.
+    Column("is_simplified", Integer, nullable=False, server_default="0"),
     Column("created_at", Text, nullable=False),
     CheckConstraint("role IN ('admin','leitor')", name="ck_users_role"),
     CheckConstraint("must_change_password IN (0,1)", name="ck_users_must_change_password"),
+    CheckConstraint("is_simplified IN (0,1)", name="ck_users_is_simplified"),
+    # Um cadastro simplificado é sempre leitor: admin sem senha utilizável
+    # seria uma conta administrativa impossível de usar e impossível de
+    # recuperar (o reset de senha é bloqueado para conta simplificada).
+    CheckConstraint(
+        "is_simplified = 0 OR role = 'leitor'", name="ck_users_simplified_is_reader"
+    ),
 )
 
 # Trilha de auditoria das ações administrativas sobre contas (hoje só o
@@ -374,6 +386,29 @@ def _migrate_add_users_session_version(engine: Engine) -> None:
         )
 
 
+def _migrate_add_users_is_simplified(engine: Engine) -> None:
+    """Adiciona users.is_simplified em bancos criados antes deste recurso.
+
+    Toda conta existente nasceu com senha própria e continua podendo logar,
+    então o default 0 é o valor correto para todas elas — a migração não muda
+    o comportamento de ninguém. As CheckConstraints declaradas na Table valem
+    para bancos novos (create_all); aqui o ADD COLUMN vai sem elas, porque
+    Postgres não aceita adicionar constraint de tabela junto do ADD COLUMN e
+    a regra também é aplicada no código (create_simplified_reader é o único
+    caminho que grava 1).
+    """
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("users")}
+    if "is_simplified" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE users ADD COLUMN is_simplified INTEGER NOT NULL DEFAULT 0")
+        )
+
+
 def _index_statements(concurrently: bool) -> list[str]:
     """CREATE INDEX de todos os índices declarados no metadata.
 
@@ -431,6 +466,7 @@ def create_schema(engine: Engine) -> None:
     _migrate_add_loans_due_date(engine)
     _migrate_add_users_must_change_password(engine)
     _migrate_add_users_session_version(engine)
+    _migrate_add_users_is_simplified(engine)
     _migrate_add_indexes(engine)
 
 
@@ -590,6 +626,200 @@ def try_create_reader(conn, full_name, email, phone, password) -> tuple[bool, st
     return try_create_account(conn, full_name, email, phone, password, "leitor")
 
 
+# ---------------------------------------------------------------------------
+# Cadastro simplificado (leitor de balcão)
+# ---------------------------------------------------------------------------
+# Numa biblioteca comunitária boa parte do público não cria conta sozinho: a
+# pessoa chega no balcão, leva o livro e vai embora. Sem um cadastro para ela,
+# o empréstimo só existiria no papel — ou viraria "livro Emprestado sem dono",
+# que é exatamente o passivo que a tela de Reconciliação existe para limpar.
+#
+# O cadastro simplificado é uma conta de leitor SEM acesso ao sistema: guarda
+# nome (e, se a pessoa quiser, e-mail/telefone) só para dizer quem está com o
+# livro. Não é um perfil novo no RBAC — continua role='leitor', então todas as
+# regras que olham o papel seguem valendo sem precisar conhecer este conceito.
+
+# Hash impossível de casar: não tem prefixo bcrypt (cai no ramo legado de
+# verify_password) e não é um hex de sha256, então compare_digest é sempre
+# falso, qualquer que seja a senha tentada. authenticate ainda recusa a conta
+# explicitamente antes disso — este valor é a segunda barreira, para o caso de
+# alguém gravar uma senha aqui por outro caminho no futuro.
+UNUSABLE_PASSWORD_HASH = "!cadastro-simplificado-sem-senha"
+
+# Domínio reservado dos e-mails internos. `.invalid` é reservado pela RFC 2606
+# justamente para isto: nunca vai existir de verdade, então um placeholder
+# jamais colide com o e-mail real de alguém nem recebe mensagem por engano.
+PLACEHOLDER_EMAIL_DOMAIN = "cadastro-simplificado.invalid"
+PLACEHOLDER_EMAIL_ATTEMPTS = 5
+
+SIMPLIFIED_NO_LOGIN_MESSAGE = (
+    "Cadastro simplificado não tem acesso ao sistema. Para dar acesso, "
+    "converta a conta em completa na Gestão de Usuários."
+)
+
+
+def generate_placeholder_email() -> str:
+    """E-mail interno para o cadastro sem e-mail informado.
+
+    A coluna users.email é NOT NULL UNIQUE (é ela que identifica a conta no
+    login), então "sem e-mail" precisa de um valor único mesmo assim. O token
+    aleatório evita a colisão na origem; quem grava ainda trata a colisão
+    improvável — ver create_simplified_reader.
+    """
+    return f"balcao-{secrets.token_hex(8)}@{PLACEHOLDER_EMAIL_DOMAIN}"
+
+
+def is_placeholder_email(email: str | None) -> bool:
+    """True para e-mail interno gerado por nós — nunca deve ser exibido,
+    exportado nem usado para falar com a pessoa."""
+    return bool(email) and email.lower().endswith(f"@{PLACEHOLDER_EMAIL_DOMAIN}")
+
+
+def display_email(email: str | None) -> str:
+    """E-mail como a tela deve mostrar: vazio quando é placeholder."""
+    return "" if (not email or is_placeholder_email(email)) else email
+
+
+def borrower_label(row) -> str:
+    """Rótulo de leitor nos seletores: nome e e-mail, ou 'sem e-mail' quando
+    a conta é simplificada e não informou um."""
+    email = display_email(row["email"])
+    return f"{row['full_name']} ({email})" if email else f"{row['full_name']} (sem e-mail)"
+
+
+def _insert_simplified_reader(conn, full_name, email, phone) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        text(
+            """INSERT INTO users
+               (full_name, email, phone, password_hash, salt, role,
+                must_change_password, session_version, is_simplified, created_at)
+               VALUES (:full_name, :email, :phone, :password_hash, '', 'leitor',
+                       0, 0, 1, :created_at)"""
+        ),
+        {
+            "full_name": full_name,
+            "email": email,
+            "phone": (phone or "").strip(),
+            "password_hash": UNUSABLE_PASSWORD_HASH,
+            "created_at": now,
+        },
+    )
+    # O id vem de um SELECT pelo e-mail (UNIQUE) em vez de RETURNING/lastrowid:
+    # é o mesmo SQL no Postgres e no SQLite, e a linha acabou de ser gravada
+    # nesta transação, então a leitura enxerga o próprio INSERT.
+    return conn.execute(
+        text("SELECT id FROM users WHERE email = :email"), {"email": email}
+    ).scalar_one()
+
+
+def create_simplified_reader(conn, full_name, email=None, phone=None) -> int:
+    """Cria o leitor de balcão e devolve o id. NÃO faz commit: quem chama
+    grava o empréstimo na mesma transação, para não sobrar cadastro órfão se
+    o empréstimo falhar.
+
+    E-mail é opcional. Informado, é validado e precisa ser inédito (a pessoa
+    pode converter a conta depois e logar com ele). Em branco, recebe um
+    placeholder interno único.
+
+    Levanta ValueError com a mensagem que a tela mostra.
+    """
+    name = (full_name or "").strip()
+    if not name:
+        raise ValueError("Nome completo é obrigatório.")
+
+    address = (email or "").strip().lower()
+    if address:
+        if not is_valid_email(address):
+            raise ValueError(
+                "E-mail inválido. Informe um endereço no formato nome@dominio.com "
+                "ou deixe em branco."
+            )
+        if is_placeholder_email(address):
+            raise ValueError("Este domínio de e-mail é reservado pelo sistema.")
+    else:
+        address = _free_placeholder_email(conn)
+
+    if get_user_by_email(conn, address) is not None:
+        raise ValueError("Já existe um cadastro com esse e-mail.")
+
+    try:
+        return _insert_simplified_reader(conn, name, address, phone)
+    except IntegrityError as exc:
+        # A checagem acima é UX (mensagem clara sem custar um erro de banco);
+        # a garantia é o UNIQUE, que fecha a corrida entre checar e inserir —
+        # mesma divisão de papéis de try_create_account. Vira ValueError para
+        # a tela tratar como as demais recusas (e dar rollback, obrigatório no
+        # Postgres depois de um IntegrityError).
+        raise ValueError(
+            "Já existe um cadastro com esse e-mail. Atualize a página e tente de novo."
+        ) from exc
+
+
+def _free_placeholder_email(conn) -> str:
+    """Sorteia um e-mail interno que ainda não está em uso.
+
+    O token aleatório já torna a colisão improvável; a conferência existe
+    porque o custo dela é um SELECT e o custo de errar seria um IntegrityError
+    no meio da transação que grava o empréstimo junto."""
+    for _ in range(PLACEHOLDER_EMAIL_ATTEMPTS):
+        candidate = generate_placeholder_email()
+        if get_user_by_email(conn, candidate) is None:
+            return candidate
+    raise ValueError(
+        "Não foi possível gerar um identificador interno para este cadastro. "
+        "Tente novamente ou informe um e-mail."
+    )
+
+
+def convert_simplified_to_full(conn, user_id, email, password, phone=None) -> None:
+    """Dá acesso ao sistema a um cadastro simplificado: grava e-mail e senha
+    e desmarca is_simplified. NÃO faz commit.
+
+    O id da conta não muda, então todo o histórico de empréstimos continua
+    ligado a ela — é conversão, não recadastro. A senha é provisória: a pessoa
+    é obrigada a trocá-la no primeiro login, como no cadastro de admin.
+
+    A revalidação acontece com a linha travada (FOR UPDATE), para que duas
+    conversões simultâneas do mesmo cadastro não gravem senhas diferentes.
+    """
+    target = conn.execute(
+        select(users_table).where(users_table.c.id == user_id).with_for_update()
+    ).mappings().first()
+    if target is None:
+        raise ValueError("Usuário não encontrado.")
+    if not target["is_simplified"]:
+        raise ValueError("Esta conta já é completa — não há o que converter.")
+
+    address = (email or "").strip().lower()
+    if not is_valid_email(address):
+        raise ValueError("E-mail inválido. Informe um endereço no formato nome@dominio.com.")
+    if is_placeholder_email(address):
+        raise ValueError("Este domínio de e-mail é reservado pelo sistema.")
+    strength_error = password_strength_error(password)
+    if strength_error:
+        raise ValueError(strength_error)
+
+    existing = get_user_by_email(conn, address)
+    if existing is not None and existing["id"] != user_id:
+        raise ValueError("Já existe um cadastro com esse e-mail.")
+
+    conn.execute(
+        text(
+            """UPDATE users
+               SET email = :email, phone = :phone, password_hash = :password_hash,
+                   salt = '', must_change_password = 1, is_simplified = 0
+               WHERE id = :id AND is_simplified = 1"""
+        ),
+        {
+            "email": address,
+            "phone": (phone if phone is not None else target["phone"]) or "",
+            "password_hash": hash_password(password),
+            "id": user_id,
+        },
+    )
+
+
 def get_user_by_email(conn, email):
     return conn.execute(
         text("SELECT * FROM users WHERE email = :email"),
@@ -618,6 +848,13 @@ def authenticate(conn, email, password):
         # e a diferença de tempo diz qual é qual. A tabela login_attempts já
         # foi feita para não distinguir os dois casos na mensagem — o relógio
         # não pode entregar o que a mensagem esconde.
+        verify_password(password, _timing_equalizer_hash(), "")
+        return None
+    if user["is_simplified"]:
+        # Cadastro de balcão não autentica, com senha nenhuma. A checagem vem
+        # antes da senha (e mesmo assim gasta o tempo de um bcrypt) para que a
+        # recusa não se distinga, nem no relógio nem na mensagem, de uma senha
+        # errada — quem tenta não descobre por aqui que a conta existe.
         verify_password(password, _timing_equalizer_hash(), "")
         return None
     if not verify_password(password, user["password_hash"], user["salt"]):
@@ -751,14 +988,21 @@ def admin_reset_password(conn, actor, target_user_id, new_password=None) -> str:
         errando a senha continuaria bloqueado mesmo com a senha nova em mãos;
       * registra na auditoria quem redefiniu a senha de quem e quando.
 
-    Levanta ValueError se o usuário não existir, ou se a senha informada pelo
-    admin não passar na regra de força.
+    Levanta ValueError se o usuário não existir, se a conta for um cadastro
+    simplificado (que não tem login para recuperar), ou se a senha informada
+    pelo admin não passar na regra de força.
     """
     target = conn.execute(
-        text("SELECT id, email FROM users WHERE id = :id"), {"id": target_user_id}
+        text("SELECT id, email, is_simplified FROM users WHERE id = :id"),
+        {"id": target_user_id},
     ).mappings().first()
     if not target:
         raise ValueError("Usuário não encontrado.")
+    if target["is_simplified"]:
+        # Gravar senha aqui criaria uma conta que o login recusa de qualquer
+        # jeito (authenticate barra is_simplified): o admin sairia com uma
+        # senha temporária na mão que não abre nada. O caminho é converter.
+        raise ValueError(SIMPLIFIED_NO_LOGIN_MESSAGE)
 
     if new_password:
         strength_error = password_strength_error(new_password)
@@ -850,6 +1094,7 @@ def list_users(
         users_table.c.phone,
         users_table.c.role,
         users_table.c.must_change_password,
+        users_table.c.is_simplified,
         users_table.c.created_at,
     )
     for clause in _users_where_clauses(query, role):
@@ -2017,6 +2262,99 @@ def _paginate(total: int, key_prefix: str) -> int:
     return (page - 1) * PAGE_SIZE
 
 
+def _loan_error(conn, exc) -> None:
+    """Mensagem única dos dois caminhos de empréstimo do catálogo."""
+    conn.rollback()
+    st.error(
+        f"Não foi possível registrar o empréstimo: {exc} "
+        "Atualize a página para ver a situação atual do livro."
+    )
+
+
+def _render_self_loan(conn, user, book) -> None:
+    """Leitor logado pegando o livro para si."""
+    with st.popover("Pegar emprestado", width="stretch"):
+        due = st.date_input(
+            "Devolução prevista",
+            value=default_due_date(),
+            key=f"due_{book['id']}",
+            help=f"Prazo padrão: {PRAZO_PADRAO_DIAS} dias. "
+            "Ajuste antes de confirmar, se necessário.",
+        )
+        if st.button("Confirmar empréstimo", key=f"borrow_{book['id']}", width="stretch"):
+            try:
+                request_loan(conn, book["id"], user["id"], due_date=due)
+                conn.commit()
+            except (ValueError, IntegrityError) as exc:
+                _loan_error(conn, exc)
+            else:
+                st.success(f'Empréstimo de "{book["title"]}" registrado!')
+                st.rerun()
+
+
+def _borrowers_for_term(conn, term: str, cache: dict):
+    """Busca de leitores memoizada dentro de UM render.
+
+    O corpo de um popover é executado a cada rerun, aberto ou não: sem esta
+    memória, uma página de 25 livros faria 50 consultas por rerun só para
+    montar seletores que ninguém abriu. Como quase todos os popovers estão com
+    a busca vazia, na prática sobra uma consulta por termo distinto. O cache
+    vive só durante o render, então nunca serve dado velho."""
+    if term not in cache:
+        cache[term] = (search_borrowers(conn, term), count_borrowers(conn, term))
+    return cache[term]
+
+
+def _render_counter_loan(conn, book, cache: dict) -> None:
+    """Empréstimo de balcão: o admin registra o livro em nome de um leitor.
+
+    Mesmo request_loan do leitor — inclusive a trava por UPDATE condicional —
+    então dois atendimentos simultâneos do mesmo exemplar continuam sem poder
+    gerar dois empréstimos ativos."""
+    book_id = book["id"]
+    with st.popover("Registrar empréstimo para…", width="stretch"):
+        term = st.text_input(
+            "Buscar leitor por nome ou e-mail",
+            key=f"loan_for_query_{book_id}",
+            help="Deixe em branco para ver os primeiros leitores em ordem alfabética.",
+        )
+        matches, total = _borrowers_for_term(conn, term, cache)
+        if not matches:
+            st.info(
+                "Nenhum leitor encontrado. Cadastre-o em **Reconciliação** "
+                "(cadastro de balcão) ou peça que ele se cadastre."
+            )
+            return
+
+        if total > len(matches):
+            st.caption(
+                f"Mostrando {len(matches)} de {total} leitores — refine a busca."
+            )
+
+        options = {borrower_label(b): b["id"] for b in matches}
+        who = st.selectbox(
+            "Leitor", list(options.keys()), key=f"loan_for_user_{book_id}"
+        )
+        due = st.date_input(
+            "Devolução prevista",
+            value=default_due_date(),
+            key=f"loan_for_due_{book_id}",
+            help=f"Prazo padrão: {PRAZO_PADRAO_DIAS} dias. "
+            "Ajuste antes de confirmar, se necessário.",
+        )
+        if st.button(
+            "Confirmar empréstimo", key=f"admin_borrow_{book_id}", width="stretch"
+        ):
+            try:
+                request_loan(conn, book_id, options[who], due_date=due)
+                conn.commit()
+            except (ValueError, IntegrityError) as exc:
+                _loan_error(conn, exc)
+            else:
+                st.success(f'Empréstimo de "{book["title"]}" registrado para {who}.')
+                st.rerun()
+
+
 def show_catalog(conn, user):
     st.header("Catálogo de Livros")
     query, category, status = _book_search_controls(conn, "catalog")
@@ -2029,6 +2367,7 @@ def show_catalog(conn, user):
     offset = _paginate(total, "catalog")
     rows = list_books(conn, query, category, status, offset=offset)
 
+    borrower_cache: dict = {}
     for r in rows:
         with st.container(border=True):
             info_col, action_col = st.columns([5, 2])
@@ -2037,32 +2376,11 @@ def show_catalog(conn, user):
                 st.caption(f"{r['author']} · {r['code']}")
                 st.write(f"{STATUS_EMOJI.get(r['status'], '')} {r['status']}")
             with action_col:
-                if user["role"] == "leitor" and r["status"] == "Disponível":
-                    with st.popover("Pegar emprestado", width="stretch"):
-                        due = st.date_input(
-                            "Devolução prevista",
-                            value=default_due_date(),
-                            key=f"due_{r['id']}",
-                            help=f"Prazo padrão: {PRAZO_PADRAO_DIAS} dias. "
-                            "Ajuste antes de confirmar, se necessário.",
-                        )
-                        if st.button(
-                            "Confirmar empréstimo",
-                            key=f"borrow_{r['id']}",
-                            width="stretch",
-                        ):
-                            try:
-                                request_loan(conn, r["id"], user["id"], due_date=due)
-                                conn.commit()
-                            except (ValueError, IntegrityError) as exc:
-                                conn.rollback()
-                                st.error(
-                                    f"Não foi possível registrar o empréstimo: {exc} "
-                                    "Atualize a página para ver a situação atual do livro."
-                                )
-                            else:
-                                st.success(f'Empréstimo de "{r["title"]}" registrado!')
-                                st.rerun()
+                if r["status"] == "Disponível":
+                    if user["role"] == "leitor":
+                        _render_self_loan(conn, user, r)
+                    elif user["role"] == "admin":
+                        _render_counter_loan(conn, r, borrower_cache)
 
 
 def show_book_management(conn):
@@ -2470,7 +2788,10 @@ def export_loans_csv(conn) -> bytes:
             r["title"],
             r["code"],
             r["full_name"] if r["full_name"] is not None else ANONYMIZED_BORROWER_LABEL,
-            r["email"] or "",
+            # display_email zera o placeholder do cadastro de balcão: e-mail
+            # interno nosso não é dado de contato e não pode sair na planilha
+            # como se fosse o endereço da pessoa.
+            display_email(r["email"]),
             r["loan_date"] or "",
             r["due_date"] or "",
             r["return_date"] or "",
@@ -2481,14 +2802,33 @@ def export_loans_csv(conn) -> bytes:
     return _to_excel_csv_bytes(LOANS_EXPORT_HEADER, data)
 
 
-def list_borrowers(conn):
-    """Leitores cadastrados, para escolher quem está com o livro."""
-    stmt = (
-        select(users_table)
-        .where(users_table.c.role == "leitor")
-        .order_by(users_table.c.full_name)
+# Quantos leitores o seletor de "quem está com o livro" mostra por vez. O
+# seletor é alimentado por busca, não pela lista inteira: com cadastro de
+# balcão o número de leitores cresce com o movimento da biblioteca, e uma
+# combo com centenas de nomes é tão inútil quanto cara.
+BORROWER_PICKER_LIMIT = 20
+
+
+def search_borrowers(conn, query: str = "", limit: int = BORROWER_PICKER_LIMIT):
+    """Leitores que casam com a busca (nome, e-mail ou telefone), no máximo
+    `limit` — a mesma busca sem acento do resto do app.
+
+    Sem busca, devolve os primeiros em ordem alfabética: serve para o admin
+    que abre o seletor e já vê alguém, em vez de uma lista vazia."""
+    stmt = select(
+        users_table.c.id,
+        users_table.c.full_name,
+        users_table.c.email,
+        users_table.c.is_simplified,
     )
+    for clause in _users_where_clauses(query, role="leitor"):
+        stmt = stmt.where(clause)
+    stmt = stmt.order_by(func.lower(users_table.c.full_name)).limit(limit)
     return conn.execute(stmt).mappings().all()
+
+
+def count_borrowers(conn, query: str = "") -> int:
+    return count_users(conn, query, role="leitor")
 
 
 def list_active_loans(conn, only_overdue: bool = False, reference_date=None):
@@ -2516,6 +2856,149 @@ def list_active_loans(conn, only_overdue: bool = False, reference_date=None):
             r for r in rows if is_overdue(r["due_date"], r["status"], reference_date)
         ]
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Histórico de empréstimos: filtro e paginação no banco
+# ---------------------------------------------------------------------------
+# Tudo aqui é resolvido em SQL — inclusive a contagem de atrasados e as listas
+# dos seletores de filtro. A tela carrega uma página por vez, e é a que traz
+# mais dado pessoal de uma só vez: quanto menos linha vier, melhor.
+#
+# Todas as consultas usam LEFT JOIN em users, como export_loans_csv: se um dia
+# um empréstimo ficar órfão (leitor removido/anonimizado no banco), a linha do
+# histórico continua aparecendo como "Leitor removido", sem nome, e-mail nem
+# telefone — com INNER JOIN ela sumiria da tela e o total mentiria.
+
+_loan_history_from = (
+    loans_table
+    .join(books_table, books_table.c.id == loans_table.c.book_id)
+    .outerjoin(users_table, users_table.c.id == loans_table.c.user_id)
+)
+
+
+def _loan_history_where_clauses(
+    book_id: int | None = None,
+    user_id: int | None = None,
+    start=None,
+    end=None,
+):
+    """Filtros de livro, leitor e período da data de empréstimo.
+
+    loan_date é TEXT ISO ("YYYY-MM-DD" ou "YYYY-MM-DDTHH:MM:SS"), que compara
+    corretamente em ordem lexicográfica. O fim do período é comparado contra o
+    dia SEGUINTE com "<", senão um empréstimo das 14h do último dia ficaria de
+    fora por causa da hora."""
+    clauses = []
+    if book_id is not None:
+        clauses.append(loans_table.c.book_id == book_id)
+    if user_id is not None:
+        clauses.append(loans_table.c.user_id == user_id)
+    start_day = _to_date(start)
+    if start_day is not None:
+        clauses.append(loans_table.c.loan_date >= start_day.isoformat())
+    end_day = _to_date(end)
+    if end_day is not None:
+        clauses.append(loans_table.c.loan_date < (end_day + timedelta(days=1)).isoformat())
+    return clauses
+
+
+def count_loan_history(conn, **filters) -> int:
+    stmt = select(func.count()).select_from(_loan_history_from)
+    for clause in _loan_history_where_clauses(**filters):
+        stmt = stmt.where(clause)
+    return conn.execute(stmt).scalar_one()
+
+
+def count_overdue_loan_history(conn, reference_date=None, **filters) -> int:
+    """Atrasados dentro do mesmo filtro — contado no banco, porque a tela só
+    tem em mãos a página atual. Mesma regra de is_overdue: ativo, com prazo, e
+    vencido antes de hoje (vencer hoje ainda não é atraso)."""
+    reference = _to_date(reference_date) or date.today()
+    stmt = (
+        select(func.count())
+        .select_from(_loan_history_from)
+        .where(loans_table.c.status == "ativo")
+        .where(loans_table.c.due_date.is_not(None))
+        .where(loans_table.c.due_date < reference.isoformat())
+    )
+    for clause in _loan_history_where_clauses(**filters):
+        stmt = stmt.where(clause)
+    return conn.execute(stmt).scalar_one()
+
+
+def list_loan_history(conn, limit: int = PAGE_SIZE, offset: int = 0, **filters):
+    """Uma página do histórico, do empréstimo mais recente para o mais antigo.
+
+    Desempate por loans.id: sem ele, dois empréstimos com a mesma loan_date
+    poderiam trocar de posição entre uma página e outra e um deles nunca
+    aparecer."""
+    stmt = select(
+        loans_table.c.id.label("loan_id"),
+        loans_table.c.loan_date,
+        loans_table.c.due_date,
+        loans_table.c.return_date,
+        loans_table.c.status,
+        books_table.c.id.label("book_id"),
+        books_table.c.title.label("book_title"),
+        books_table.c.code.label("book_code"),
+        loans_table.c.user_id,
+        users_table.c.full_name,
+        users_table.c.email,
+        users_table.c.phone,
+    ).select_from(_loan_history_from)
+    for clause in _loan_history_where_clauses(**filters):
+        stmt = stmt.where(clause)
+    stmt = (
+        stmt.order_by(loans_table.c.loan_date.desc(), loans_table.c.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return conn.execute(stmt).mappings().all()
+
+
+def list_loan_history_books(conn):
+    """Livros que aparecem no histórico — consulta própria, três colunas, uma
+    linha por livro. Alimenta o seletor de filtro sem carregar empréstimo
+    nenhum."""
+    stmt = (
+        select(books_table.c.id, books_table.c.title, books_table.c.code)
+        .where(select(loans_table.c.id)
+               .where(loans_table.c.book_id == books_table.c.id)
+               .exists())
+        .order_by(func.lower(books_table.c.title))
+    )
+    return conn.execute(stmt).mappings().all()
+
+
+def list_loan_history_borrowers(conn):
+    """Leitores que aparecem no histórico, para o seletor de filtro.
+
+    Um empréstimo órfão (leitor removido) não entra: não há por quem filtrar,
+    e ele continua visível na listagem como "Leitor removido"."""
+    stmt = (
+        select(users_table.c.id, users_table.c.full_name, users_table.c.email)
+        .where(select(loans_table.c.id)
+               .where(loans_table.c.user_id == users_table.c.id)
+               .exists())
+        .order_by(func.lower(users_table.c.full_name))
+    )
+    return conn.execute(stmt).mappings().all()
+
+
+def loan_history_date_bounds(conn) -> tuple[date | None, date | None]:
+    """Primeira e última data de empréstimo registradas, para o valor inicial
+    do filtro de período. Dois agregados numa consulta só, sem trazer linha."""
+    row = conn.execute(
+        select(func.min(loans_table.c.loan_date), func.max(loans_table.c.loan_date))
+    ).first()
+    if row is None or row[0] is None:
+        return None, None
+    return _to_date(row[0]), _to_date(row[1])
+
+
+def _history_borrower_name(row) -> str:
+    return row["full_name"] if row["full_name"] is not None else ANONYMIZED_BORROWER_LABEL
 
 
 def _due_date_caption(due_date, status, reference_date=None) -> str:
@@ -2552,7 +3035,10 @@ def show_loan_management(conn):
             info_col, action_col = st.columns([5, 2])
             with info_col:
                 st.markdown(f"{'🔴 ' if late else ''}**{r['title']}** ({r['code']})")
-                st.caption(f"{r['full_name']} · {r['email']} · {r['phone'] or '-'}")
+                st.caption(
+                    f"{r['full_name']} · {display_email(r['email']) or 'sem e-mail'} · "
+                    f"{r['phone'] or '-'}"
+                )
                 st.write(f"Emprestado em {r['loan_date']}")
                 if late:
                     st.error(_due_date_caption(r["due_date"], r["status"]))
@@ -2579,64 +3065,61 @@ def show_loan_management(conn):
 def show_admin_loan_history(conn):
     st.header("Histórico completo de empréstimos")
 
-    rows = conn.execute(
-        text(
-            """
-            SELECT loans.id AS loan_id, loans.loan_date, loans.due_date,
-                   loans.return_date, loans.status,
-                   books.id AS book_id, books.title AS book_title, books.code AS book_code,
-                   users.id AS user_id, users.full_name, users.email, users.phone
-            FROM loans
-            JOIN books ON books.id = loans.book_id
-            JOIN users ON users.id = loans.user_id
-            ORDER BY loans.loan_date DESC
-            """
-        )
-    ).mappings().all()
-
-    if not rows:
+    first_day, last_day = loan_history_date_bounds(conn)
+    if first_day is None:
         st.info("Nenhum empréstimo registrado ainda.")
         return
 
     book_options = {"Todos": None}
-    for title, code, book_id in sorted(
-        {(r["book_title"], r["book_code"], r["book_id"]) for r in rows}
-    ):
-        book_options[f"{title} ({code})"] = book_id
+    for b in list_loan_history_books(conn):
+        book_options[f"{b['title']} ({b['code']})"] = b["id"]
 
     user_options = {"Todos": None}
-    for name, email, user_id in sorted(
-        {(r["full_name"], r["email"], r["user_id"]) for r in rows}
-    ):
-        user_options[f"{name} ({email})"] = user_id
-
-    loan_dates = [datetime.fromisoformat(r["loan_date"]).date() for r in rows]
+    for b in list_loan_history_borrowers(conn):
+        user_options[borrower_label(b)] = b["id"]
 
     col1, col2, col3 = st.columns(3)
-    book_choice = col1.selectbox("Filtrar por livro", list(book_options.keys()))
-    user_choice = col2.selectbox("Filtrar por usuário", list(user_options.keys()))
+    book_choice = col1.selectbox(
+        "Filtrar por livro", list(book_options.keys()), key="history_book"
+    )
+    user_choice = col2.selectbox(
+        "Filtrar por usuário", list(user_options.keys()), key="history_user"
+    )
     date_range = col3.date_input(
         "Período (data de empréstimo)",
-        value=(min(loan_dates), max(loan_dates)),
+        value=(first_day, last_day),
+        key="history_period",
     )
 
-    filtered = rows
-    if book_options[book_choice] is not None:
-        filtered = [r for r in filtered if r["book_id"] == book_options[book_choice]]
-    if user_options[user_choice] is not None:
-        filtered = [r for r in filtered if r["user_id"] == user_options[user_choice]]
+    start_day, end_day = None, None
     if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-        filtered = [
-            r
-            for r in filtered
-            if start <= datetime.fromisoformat(r["loan_date"]).date() <= end
-        ]
+        start_day, end_day = date_range
 
-    overdue_total = sum(1 for r in filtered if is_overdue(r["due_date"], r["status"]))
-    st.write(f"{len(filtered)} empréstimo(s) encontrado(s).")
+    filters = {
+        "book_id": book_options[book_choice],
+        "user_id": user_options[user_choice],
+        "start": start_day,
+        "end": end_day,
+    }
+
+    # Mudou algum filtro -> volta para a 1ª página, como no Catálogo: senão o
+    # admin continuaria na página 7 de um resultado que agora tem duas.
+    signature = (book_choice, user_choice, str(start_day), str(end_day))
+    if st.session_state.get("history_filter_signature") != signature:
+        st.session_state["history_filter_signature"] = signature
+        st.session_state["history_page"] = 1
+
+    total = count_loan_history(conn, **filters)
+    st.write(f"{total} empréstimo(s) encontrado(s).")
+    if not total:
+        return
+
+    overdue_total = count_overdue_loan_history(conn, **filters)
     if overdue_total:
         st.warning(f"⚠️ {overdue_total} deles em atraso.")
+
+    offset = _paginate(total, "history")
+    rows = list_loan_history(conn, offset=offset, **filters)
 
     status_emoji = {"ativo": "🔴", "devolvido": "🟢"}
 
@@ -2649,29 +3132,40 @@ def show_admin_loan_history(conn):
     table = [
         {
             "Livro": f"{r['book_title']} ({r['book_code']})",
-            "Leitor": r["full_name"],
-            "E-mail": r["email"],
+            "Leitor": _history_borrower_name(r),
+            "E-mail": display_email(r["email"]) or "-",
             "Telefone": r["phone"] or "-",
             "Emprestado em": r["loan_date"],
             "Prevista": r["due_date"] or "-",
             "Devolvido em": r["return_date"] or "-",
             "Status": _situacao(r),
         }
-        for r in filtered
+        for r in rows
     ]
     st.dataframe(table, width="stretch")
 
-    if user_options[user_choice] is not None:
-        user_loans = [r for r in rows if r["user_id"] == user_options[user_choice]]
-        with st.expander(f"📋 Todos os empréstimos de {user_choice}", expanded=True):
-            for r in user_loans:
-                late = days_overdue(r["due_date"]) if r["status"] == "ativo" else 0
-                marker = f" — 🔴 atrasado há {late} dia(s)" if late else ""
-                st.write(
-                    f"- **{r['book_title']}** ({r['book_code']}) — "
-                    f"{r['loan_date']} → {r['return_date'] or 'em aberto'} "
-                    f"[prevista: {r['due_date'] or 'sem prazo'}] [{r['status']}]{marker}"
-                )
+    if filters["user_id"] is not None:
+        _render_borrower_history(conn, filters["user_id"], user_choice)
+
+
+def _render_borrower_history(conn, user_id, label) -> None:
+    """Últimos empréstimos do leitor filtrado, ignorando livro e período — é a
+    pergunta "o que mais está com essa pessoa?", que os outros filtros
+    esconderiam. Limitado a uma página: quem precisa de mais usa a listagem
+    acima, que é paginada."""
+    loans = list_loan_history(conn, user_id=user_id)
+    total = count_loan_history(conn, user_id=user_id)
+    with st.expander(f"📋 Todos os empréstimos de {label}", expanded=True):
+        if total > len(loans):
+            st.caption(f"Mostrando os {len(loans)} mais recentes de {total}.")
+        for r in loans:
+            late = days_overdue(r["due_date"]) if r["status"] == "ativo" else 0
+            marker = f" — 🔴 atrasado há {late} dia(s)" if late else ""
+            st.write(
+                f"- **{r['book_title']}** ({r['book_code']}) — "
+                f"{r['loan_date']} → {r['return_date'] or 'em aberto'} "
+                f"[prevista: {r['due_date'] or 'sem prazo'}] [{r['status']}]{marker}"
+            )
 
 
 def show_my_loans(conn, user):
@@ -2877,6 +3371,41 @@ def _render_new_admin_form(conn) -> None:
                         st.error(error_message)
 
 
+def _render_convert_simplified(conn, row) -> None:
+    """Bloco 'Dar acesso ao sistema' de um cadastro de balcão.
+
+    Converter mantém o mesmo id, então o histórico de empréstimos da pessoa
+    continua inteiro — é a mesma conta ganhando login, não um cadastro novo."""
+    st.markdown("---")
+    st.markdown("**Dar acesso ao sistema**")
+    st.caption(
+        "Transforma este cadastro de balcão em conta completa, preservando todo "
+        "o histórico de empréstimos. A senha definida aqui é provisória: a pessoa "
+        "é obrigada a trocá-la no primeiro login."
+    )
+    email = st.text_input("E-mail de acesso", key=f"convert_email_{row['id']}")
+    phone = st.text_input(
+        "Telefone/WhatsApp",
+        value=row["phone"] or "",
+        key=f"convert_phone_{row['id']}",
+    )
+    password = st.text_input(
+        "Senha provisória", type="password", key=f"convert_pw_{row['id']}"
+    )
+    if st.button("🔓 Converter em conta completa", key=f"convert_{row['id']}"):
+        try:
+            convert_simplified_to_full(conn, row["id"], email, password, phone)
+            conn.commit()
+        except (ValueError, IntegrityError) as exc:
+            conn.rollback()
+            st.error(f"Não foi possível converter o cadastro: {exc}")
+        else:
+            st.success(
+                f"**{row['full_name']}** agora tem acesso com o e-mail {email.strip().lower()}."
+            )
+            st.rerun()
+
+
 def _render_password_reset(conn, current_user, row) -> None:
     """Bloco 'Redefinir senha' de um usuário na listagem."""
     st.markdown("---")
@@ -2942,16 +3471,31 @@ def show_user_management(conn, current_user):
         offset = _paginate(total, "users")
         for row in list_users(conn, query, offset=offset):
             is_admin = row["role"] == "admin"
-            icon = "🛡️" if is_admin else "👤"
-            with st.expander(f"{icon} {row['full_name']} — {row['email']}"):
+            icon = "🛡️" if is_admin else ("🪪" if row["is_simplified"] else "👤")
+            contact = display_email(row["email"]) or "sem e-mail"
+            with st.expander(f"{icon} {row['full_name']} — {contact}"):
+                if row["is_simplified"]:
+                    perfil = "Leitor (cadastro de balcão)"
+                else:
+                    perfil = "Administrador" if is_admin else "Leitor"
                 st.caption(
-                    f"Perfil: **{'Administrador' if is_admin else 'Leitor'}** · "
+                    f"Perfil: **{perfil}** · "
                     f"Telefone: {row['phone'] or '—'} · "
                     f"Cadastro: {row['created_at'][:10]}"
                 )
-                if row["must_change_password"]:
+                if row["is_simplified"]:
+                    st.info(
+                        "Cadastro criado no balcão: serve para registrar empréstimos "
+                        "em nome desta pessoa e **não dá acesso ao sistema**."
+                    )
+                elif row["must_change_password"]:
                     st.info("Troca de senha pendente no próximo login.")
-                _render_password_reset(conn, current_user, row)
+                # Conta de balcão não tem senha para redefinir: o que ela pode
+                # ganhar é acesso, e é isso que o bloco oferece no lugar.
+                if row["is_simplified"]:
+                    _render_convert_simplified(conn, row)
+                else:
+                    _render_password_reset(conn, current_user, row)
     else:
         st.info("Nenhum usuário encontrado.")
 
@@ -3001,6 +3545,75 @@ def _show_loaned_but_available_warning(conn) -> None:
     )
 
 
+def _render_reconcile_loan(conn, book, cache: dict) -> None:
+    """Corpo do "Registrar empréstimo" da reconciliação: escolher um leitor já
+    cadastrado ou criar o cadastro de balcão na hora.
+
+    O caminho do cadastro novo grava a conta e o empréstimo na MESMA
+    transação: se a reconciliação falhar (outra sessão regularizou o livro no
+    meio do caminho), o rollback leva junto o cadastro que acabou de nascer, e
+    não fica um leitor fantasma sem empréstimo nenhum.
+    """
+    book_id = book["id"]
+    loan_day = st.date_input(
+        "Data do empréstimo", value=date.today(), key=f"rec_loan_date_{book_id}"
+    )
+    due = st.date_input(
+        "Devolução prevista", value=default_due_date(), key=f"rec_due_{book_id}"
+    )
+
+    def _registrar(user_id, quem):
+        try:
+            reconcile_register_loan(
+                conn, book_id, user_id, loan_date=loan_day, due_date=due
+            )
+            conn.commit()
+        except (ValueError, IntegrityError) as exc:
+            conn.rollback()
+            st.error(str(exc))
+        else:
+            st.success(f'Empréstimo de "{book["title"]}" registrado para {quem}.')
+            st.rerun()
+
+    st.markdown("**Quem está com o livro**")
+    term = st.text_input(
+        "Buscar leitor por nome ou e-mail", key=f"rec_query_{book_id}"
+    )
+    matches, _total = _borrowers_for_term(conn, term, cache)
+    if matches:
+        options = {borrower_label(b): b["id"] for b in matches}
+        who = st.selectbox("Leitor", list(options.keys()), key=f"rec_user_{book_id}")
+        if st.button("Confirmar registro", key=f"rec_confirm_{book_id}", width="stretch"):
+            _registrar(options[who], who)
+    else:
+        st.caption(
+            "Nenhum leitor cadastrado corresponde à busca."
+            if term
+            else "Nenhum leitor cadastrado ainda."
+        )
+
+    st.markdown("---")
+    st.caption(
+        "Não está na lista? Cadastre aqui mesmo. O cadastro de balcão guarda só "
+        "quem está com o livro — não dá acesso ao sistema e o e-mail é opcional."
+    )
+    new_name = st.text_input("Nome completo do leitor", key=f"rec_new_name_{book_id}")
+    new_email = st.text_input("E-mail (opcional)", key=f"rec_new_email_{book_id}")
+    new_phone = st.text_input("Telefone (opcional)", key=f"rec_new_phone_{book_id}")
+    if st.button(
+        "Cadastrar e registrar empréstimo",
+        key=f"rec_new_confirm_{book_id}",
+        width="stretch",
+    ):
+        try:
+            new_id = create_simplified_reader(conn, new_name, new_email, new_phone)
+        except (ValueError, IntegrityError) as exc:
+            conn.rollback()
+            st.error(str(exc))
+        else:
+            _registrar(new_id, new_name.strip())
+
+
 def show_loan_reconciliation(conn):
     st.header("Reconciliação de empréstimos")
     st.caption(
@@ -3032,17 +3645,10 @@ def show_loan_reconciliation(conn):
         )
         return
 
-    borrowers = list_borrowers(conn)
-    if not borrowers:
-        st.warning(
-            "Nenhum leitor cadastrado ainda — só é possível marcar como devolvido. "
-            "Cadastre o leitor para poder registrar o empréstimo."
-        )
-    borrower_labels = {f"{b['full_name']} ({b['email']})": b["id"] for b in borrowers}
-
     offset = _paginate(total, "reconcile")
     rows = list_unreconciled_books(conn, query, offset=offset)
 
+    borrower_cache: dict = {}
     for r in rows:
         with st.container(border=True):
             st.markdown(f"**{r['title']}** ({r['code']})")
@@ -3052,45 +3658,7 @@ def show_loan_reconciliation(conn):
 
             with col_loan:
                 with st.popover("📝 Registrar empréstimo", width="stretch"):
-                    if not borrower_labels:
-                        st.info("Cadastre um leitor primeiro.")
-                    else:
-                        who = st.selectbox(
-                            "Quem está com o livro",
-                            list(borrower_labels.keys()),
-                            key=f"rec_user_{r['id']}",
-                        )
-                        loan_day = st.date_input(
-                            "Data do empréstimo",
-                            value=date.today(),
-                            key=f"rec_loan_date_{r['id']}",
-                        )
-                        due = st.date_input(
-                            "Devolução prevista",
-                            value=default_due_date(),
-                            key=f"rec_due_{r['id']}",
-                        )
-                        if st.button(
-                            "Confirmar registro",
-                            key=f"rec_confirm_{r['id']}",
-                            width="stretch",
-                        ):
-                            try:
-                                reconcile_register_loan(
-                                    conn,
-                                    r["id"],
-                                    borrower_labels[who],
-                                    loan_date=loan_day,
-                                    due_date=due,
-                                )
-                                conn.commit()
-                                st.success(
-                                    f'Empréstimo de "{r["title"]}" registrado para {who}.'
-                                )
-                                st.rerun()
-                            except (ValueError, IntegrityError) as exc:
-                                conn.rollback()
-                                st.error(str(exc))
+                    _render_reconcile_loan(conn, r, borrower_cache)
 
             with col_return:
                 if st.button(
