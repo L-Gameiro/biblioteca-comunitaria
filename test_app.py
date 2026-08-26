@@ -26,17 +26,10 @@ from app import (
     AUDIT_ACTION_PASSWORD_RESET,
     BookCodeAllocator,
     PAGE_SIZE,
-    SIMPLIFIED_NO_LOGIN_MESSAGE,
-    UNUSABLE_PASSWORD_HASH,
     borrower_label,
-    convert_simplified_to_full,
     count_borrowers,
     count_loan_history,
     count_overdue_loan_history,
-    create_simplified_reader,
-    display_email,
-    generate_placeholder_email,
-    is_placeholder_email,
     list_loan_history,
     list_loan_history_books,
     list_loan_history_borrowers,
@@ -4314,7 +4307,7 @@ def test_login_bem_sucedido_limpa_o_bloqueio_de_forma_duravel(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# Empréstimo de balcão e cadastro simplificado (achado 7)
+# Empréstimo de balcão pelo admin, para leitor já cadastrado (achado 7)
 # ---------------------------------------------------------------------------
 
 def _admin_view(admin_row) -> dict:
@@ -4459,360 +4452,7 @@ def test_seletor_de_leitor_respeita_o_limite_da_pagina(conn):
     assert count_borrowers(conn) == app.BORROWER_PICKER_LIMIT + 5
 
 
-# --- cadastro simplificado -------------------------------------------------
-
-def test_cadastro_simplificado_com_email_informado(conn):
-    user_id = create_simplified_reader(conn, "  Dona Maria  ", "Dona.Maria@Teste.org", "9999")
-    conn.commit()
-
-    row = conn.execute(
-        text("SELECT * FROM users WHERE id = :i"), {"i": user_id}
-    ).mappings().first()
-    assert row["full_name"] == "Dona Maria"
-    assert row["email"] == "dona.maria@teste.org"   # normalizado
-    assert row["phone"] == "9999"
-    assert row["role"] == "leitor"
-    assert row["is_simplified"] == 1
-    assert row["password_hash"] == UNUSABLE_PASSWORD_HASH
-    assert not is_placeholder_email(row["email"])
-
-
-def test_cadastro_simplificado_sem_email_recebe_placeholder_interno(conn):
-    user_id = create_simplified_reader(conn, "Seu João")
-    conn.commit()
-
-    row = conn.execute(
-        text("SELECT * FROM users WHERE id = :i"), {"i": user_id}
-    ).mappings().first()
-    assert is_placeholder_email(row["email"])
-    # o placeholder nunca chega à tela nem à exportação
-    assert display_email(row["email"]) == ""
-    assert borrower_label(row) == "Seu João (sem e-mail)"
-
-
-@pytest.mark.parametrize(
-    "nome, email, erro",
-    [
-        ("   ", None, "Nome completo é obrigatório."),
-        ("Fulano", "sem-arroba", "E-mail inválido"),
-        ("Fulano", f"x@{app.PLACEHOLDER_EMAIL_DOMAIN}", "domínio de e-mail é reservado"),
-    ],
-)
-def test_cadastro_simplificado_recusa_entrada_invalida(conn, nome, email, erro):
-    with pytest.raises(ValueError, match=erro):
-        create_simplified_reader(conn, nome, email)
-
-
-def test_cadastro_simplificado_recusa_email_ja_usado(conn):
-    create_user(conn, "Já Existe", "ocupado@teste.org", "", "senha1234", "leitor")
-    conn.commit()
-
-    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
-        create_simplified_reader(conn, "Outro Alguém", "OCUPADO@teste.org")
-
-
-def test_placeholder_de_email_nao_colide_com_um_ja_usado(conn, monkeypatch):
-    """Se o token sorteado repetir um placeholder já em uso, o cadastro sorteia
-    outro — sem tocar no cadastro anterior e sem erro de banco no meio da
-    transação que grava o empréstimo junto."""
-    repetido = f"balcao-repetido@{app.PLACEHOLDER_EMAIL_DOMAIN}"
-    livre = f"balcao-livre@{app.PLACEHOLDER_EMAIL_DOMAIN}"
-
-    monkeypatch.setattr(app, "generate_placeholder_email", lambda: repetido)
-    primeiro = create_simplified_reader(conn, "Primeiro")
-    conn.commit()
-
-    sorteios = iter([repetido, livre])
-    monkeypatch.setattr(app, "generate_placeholder_email", lambda: next(sorteios))
-    segundo = create_simplified_reader(conn, "Segundo")
-    conn.commit()
-
-    assert segundo != primeiro
-    emails = dict(conn.execute(text("SELECT id, email FROM users")).all())
-    assert emails[primeiro] == repetido
-    assert emails[segundo] == livre
-
-
-def test_cadastro_simplificado_traduz_corrida_no_unique_em_mensagem(conn, monkeypatch):
-    """A checagem prévia é UX; quem garante é o UNIQUE. Se o e-mail for tomado
-    entre uma coisa e outra, a tela recebe recusa tratada, não IntegrityError."""
-    def _corrida(*args, **kwargs):
-        raise _integrity_error()
-
-    monkeypatch.setattr(app, "_insert_simplified_reader", _corrida)
-
-    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
-        create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
-    conn.rollback()
-
-
-def test_placeholder_desiste_com_mensagem_se_nunca_encontrar_um_livre(conn, monkeypatch):
-    unico = f"balcao-unico@{app.PLACEHOLDER_EMAIL_DOMAIN}"
-    monkeypatch.setattr(app, "generate_placeholder_email", lambda: unico)
-    create_simplified_reader(conn, "Primeiro")
-    conn.commit()
-
-    with pytest.raises(ValueError, match="identificador interno"):
-        create_simplified_reader(conn, "Segundo")
-
-
-def test_placeholders_gerados_sao_distintos_e_do_dominio_reservado():
-    gerados = {generate_placeholder_email() for _ in range(50)}
-    assert len(gerados) == 50
-    assert all(is_placeholder_email(e) for e in gerados)
-    assert all(is_valid_email(e) for e in gerados)
-
-
-# --- cadastro simplificado não autentica -----------------------------------
-
-def test_login_em_cadastro_simplificado_e_recusado(conn):
-    create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
-    conn.commit()
-
-    assert authenticate(conn, "dona@teste.org", "") is None
-    assert authenticate(conn, "dona@teste.org", UNUSABLE_PASSWORD_HASH) is None
-    assert authenticate(conn, "dona@teste.org", "SenhaQualquer1") is None
-
-
-def test_login_recusado_mesmo_se_a_conta_ganhar_um_hash_valido_por_fora(conn):
-    """A barreira é o is_simplified, não só o hash impossível: uma senha
-    gravada direto no banco continua não abrindo a conta."""
-    user_id = create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
-    conn.execute(
-        text("UPDATE users SET password_hash = :h WHERE id = :i"),
-        {"h": hash_password("SenhaValida1"), "i": user_id},
-    )
-    conn.commit()
-
-    assert authenticate(conn, "dona@teste.org", "SenhaValida1") is None
-
-
-def test_reset_de_senha_e_bloqueado_em_cadastro_simplificado(conn):
-    """Redefinir senha aqui entregaria ao admin uma senha que não abre nada —
-    o caminho certo é converter a conta."""
-    create_user(conn, "Admin R", "admin.r@teste.org", "", "SenhaAdmin1", "admin")
-    user_id = create_simplified_reader(conn, "Dona Maria", "dona@teste.org")
-    conn.commit()
-    admin = get_user_by_email(conn, "admin.r@teste.org")
-
-    with pytest.raises(ValueError, match="não tem acesso ao sistema"):
-        admin_reset_password(conn, admin, user_id)
-    assert SIMPLIFIED_NO_LOGIN_MESSAGE.startswith("Cadastro simplificado")
-    assert list_admin_audit(conn) == []
-
-
-def test_cadastro_simplificado_nao_conta_como_admin_nem_muda_de_papel(conn):
-    """Regras existentes que olham o papel continuam válidas: a conta de
-    balcão é leitor, e a constraint impede que ela vire admin."""
-    create_user(conn, "Admin Único", "admin.u@teste.org", "", "SenhaAdmin1", "admin")
-    user_id = create_simplified_reader(conn, "Dona Maria")
-    conn.commit()
-
-    assert count_admins(conn) == 1
-    with pytest.raises(Exception):
-        conn.execute(
-            text("UPDATE users SET role = 'admin' WHERE id = :i"), {"i": user_id}
-        )
-        conn.commit()
-    conn.rollback()
-
-
-# --- conversão em conta completa -------------------------------------------
-
-def test_conversao_em_conta_completa_preserva_o_historico(conn):
-    user_id = create_simplified_reader(conn, "Dona Maria", phone="1234")
-    code = add_book(conn, "Iracema", "José Alencar", "Literária")
-    conn.commit()
-    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
-    request_loan(conn, book_id, user_id)
-    conn.commit()
-
-    convert_simplified_to_full(conn, user_id, "Dona.Maria@teste.org", "SenhaNova#1")
-    conn.commit()
-
-    row = conn.execute(text("SELECT * FROM users WHERE id = :i"), {"i": user_id}).mappings().first()
-    assert row["is_simplified"] == 0
-    assert row["email"] == "dona.maria@teste.org"
-    assert row["must_change_password"] == 1
-    assert row["phone"] == "1234"          # telefone antigo preservado
-    # mesmo id, mesmo histórico
-    assert count_loan_history(conn, user_id=user_id) == 1
-    assert list_loan_history(conn, user_id=user_id)[0]["book_id"] == book_id
-    # e agora a conta entra
-    logado = authenticate(conn, "dona.maria@teste.org", "SenhaNova#1")
-    assert logado is not None and logado["id"] == user_id
-
-
-def test_conversao_recusa_senha_fraca_email_invalido_e_email_ocupado(conn):
-    create_user(conn, "Outro", "outro@teste.org", "", "senha1234", "leitor")
-    user_id = create_simplified_reader(conn, "Dona Maria")
-    conn.commit()
-
-    with pytest.raises(ValueError, match="E-mail inválido"):
-        convert_simplified_to_full(conn, user_id, "nao-e-email", "SenhaNova#1")
-    with pytest.raises(ValueError):
-        convert_simplified_to_full(conn, user_id, "dona@teste.org", "curta")
-    with pytest.raises(ValueError, match="Já existe um cadastro com esse e-mail."):
-        convert_simplified_to_full(conn, user_id, "outro@teste.org", "SenhaNova#1")
-
-    conn.rollback()
-    assert conn.execute(
-        text("SELECT is_simplified FROM users WHERE id = :i"), {"i": user_id}
-    ).scalar_one() == 1
-
-
-def test_conversao_de_conta_que_ja_e_completa_e_recusada(conn):
-    create_user(conn, "Completa", "completa@teste.org", "", "senha1234", "leitor")
-    conn.commit()
-    completa = get_user_by_email(conn, "completa@teste.org")
-
-    with pytest.raises(ValueError, match="já é completa"):
-        convert_simplified_to_full(conn, completa["id"], "nova@teste.org", "SenhaNova#1")
-    with pytest.raises(ValueError, match="Usuário não encontrado."):
-        convert_simplified_to_full(conn, 99999, "nova@teste.org", "SenhaNova#1")
-
-
-def test_tela_de_usuarios_oferece_conversao_e_nao_reset_para_cadastro_de_balcao(
-    conn, monkeypatch
-):
-    create_user(conn, "Admin T", "admin.t@teste.org", "", "SenhaAdmin1", "admin")
-    user_id = create_simplified_reader(conn, "Dona Maria")
-    conn.commit()
-    admin = _admin_view(get_user_by_email(conn, "admin.t@teste.org"))
-
-    oferecidos = []
-    monkeypatch.setattr(
-        app.st, "button", lambda *a, **k: oferecidos.append(k.get("key")) or False
-    )
-    monkeypatch.setattr(app.st, "checkbox", lambda *a, **k: False)
-    monkeypatch.setattr(app.st, "expander", lambda *a, **k: contextlib.nullcontext())
-    monkeypatch.setattr(app.st, "form", lambda *a, **k: contextlib.nullcontext())
-    monkeypatch.setattr(app.st, "form_submit_button", lambda *a, **k: False)
-    monkeypatch.setattr(app.st, "session_state", _SessionStateFake())
-
-    app.show_user_management(conn, admin)
-
-    assert f"convert_{user_id}" in oferecidos
-    assert f"reset_{user_id}" not in oferecidos
-
-
-def test_tela_de_usuarios_converte_o_cadastro_de_balcao(conn, monkeypatch):
-    create_user(conn, "Admin T", "admin.t2@teste.org", "", "SenhaAdmin1", "admin")
-    user_id = create_simplified_reader(conn, "Dona Maria")
-    conn.commit()
-    admin = _admin_view(get_user_by_email(conn, "admin.t2@teste.org"))
-
-    campos = {"E-mail de acesso": "dona@teste.org", "Senha provisória": "SenhaNova#1"}
-    monkeypatch.setattr(
-        app.st, "text_input", lambda label, *a, **k: campos.get(label, k.get("value", ""))
-    )
-    monkeypatch.setattr(app.st, "checkbox", lambda *a, **k: False)
-    tela = _Tela(monkeypatch, botoes={f"convert_{user_id}"})
-
-    app.show_user_management(conn, admin)
-
-    assert tela.erros == []
-    assert authenticate(conn, "dona@teste.org", "SenhaNova#1") is not None
-
-
-# --- reconciliação com cadastro de balcão ----------------------------------
-
-def test_reconciliacao_cria_cadastro_simplificado_e_registra_o_emprestimo(
-    acervo_para_reconciliar, monkeypatch
-):
-    conn, codes, _ = acervo_para_reconciliar
-    book = _book_by_code(conn, codes["Pendente Um"])
-
-    campos = {
-        "Nome completo do leitor": "Vizinha do 302",
-        "E-mail (opcional)": "",
-        "Telefone (opcional)": "988887777",
-    }
-    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
-    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
-
-    app.show_loan_reconciliation(conn)
-
-    assert tela.erros == []
-    novo = conn.execute(
-        text("SELECT * FROM users WHERE full_name = 'Vizinha do 302'")
-    ).mappings().first()
-    assert novo["is_simplified"] == 1
-    assert novo["phone"] == "988887777"
-    assert is_placeholder_email(novo["email"])
-
-    loan = conn.execute(
-        text("SELECT * FROM loans WHERE book_id = :b"), {"b": book["id"]}
-    ).mappings().first()
-    assert loan["user_id"] == novo["id"]
-    assert loan["status"] == "ativo"
-    # o livro segue fisicamente com a pessoa
-    assert conn.execute(
-        text("SELECT status FROM books WHERE id = :i"), {"i": book["id"]}
-    ).scalar_one() == "Emprestado"
-
-
-def test_reconciliacao_com_email_informado_permite_converter_depois(
-    acervo_para_reconciliar, monkeypatch
-):
-    conn, codes, _ = acervo_para_reconciliar
-    book = _book_by_code(conn, codes["Pendente Um"])
-
-    campos = {
-        "Nome completo do leitor": "Vizinho do 101",
-        "E-mail (opcional)": "vizinho@teste.org",
-        "Telefone (opcional)": "",
-    }
-    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
-    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
-
-    app.show_loan_reconciliation(conn)
-
-    assert tela.erros == []
-    novo = get_user_by_email(conn, "vizinho@teste.org")
-    assert novo["is_simplified"] == 1
-    assert authenticate(conn, "vizinho@teste.org", "qualquer") is None
-
-
-def test_reconciliacao_nao_deixa_cadastro_orfao_se_o_emprestimo_falhar(
-    acervo_para_reconciliar, monkeypatch
-):
-    """Cadastro e empréstimo saem na mesma transação: se outra sessão
-    reconciliou o livro no meio do caminho, o rollback leva os dois."""
-    conn, codes, _ = acervo_para_reconciliar
-    book = _book_by_code(conn, codes["Pendente Um"])
-
-    campos = {"Nome completo do leitor": "Fantasma", "E-mail (opcional)": "",
-              "Telefone (opcional)": ""}
-    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: campos.get(label, ""))
-    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
-    _falha_com(
-        monkeypatch, "reconcile_register_loan", ValueError("Outra pessoa já o reconciliou.")
-    )
-
-    app.show_loan_reconciliation(conn)  # não levanta
-
-    assert "reconciliou" in tela.texto
-    assert conn.execute(
-        text("SELECT COUNT(*) FROM users WHERE full_name = 'Fantasma'")
-    ).scalar_one() == 0
-
-
-def test_reconciliacao_recusa_cadastro_sem_nome(acervo_para_reconciliar, monkeypatch):
-    conn, codes, _ = acervo_para_reconciliar
-    book = _book_by_code(conn, codes["Pendente Um"])
-
-    monkeypatch.setattr(app.st, "text_input", lambda label, *a, **k: "")
-    tela = _Tela(monkeypatch, botoes={f"rec_new_confirm_{book['id']}"})
-
-    app.show_loan_reconciliation(conn)
-
-    assert "Nome completo é obrigatório." in tela.texto
-    assert conn.execute(text("SELECT COUNT(*) FROM loans WHERE book_id = :b"),
-                        {"b": book["id"]}).scalar_one() == 0
-
-
-def test_reconciliacao_continua_registrando_para_leitor_ja_cadastrado(
+def test_reconciliacao_registra_emprestimo_para_leitor_ja_cadastrado(
     acervo_para_reconciliar, monkeypatch
 ):
     conn, codes, leitor = acervo_para_reconciliar
@@ -5024,20 +4664,6 @@ def test_historico_preserva_a_linha_de_leitor_removido_sem_expor_dados(historico
     assert count_loan_history(conn, user_id=ana["id"]) == 2
 
 
-def test_historico_nao_mostra_o_email_interno_do_cadastro_de_balcao(conn):
-    user_id = create_simplified_reader(conn, "Dona Maria")
-    code = add_book(conn, "Iracema", "José Alencar", "Literária")
-    conn.commit()
-    book_id = conn.execute(text("SELECT id FROM books WHERE code = :c"), {"c": code}).scalar_one()
-    _insert_loan(conn, book_id, user_id, "2026-05-01", "2026-05-15")
-    conn.commit()
-
-    row = list_loan_history(conn)[0]
-    assert row["full_name"] == "Dona Maria"
-    assert display_email(row["email"]) == ""
-    assert borrower_label(list_loan_history_borrowers(conn)[0]) == "Dona Maria (sem e-mail)"
-
-
 # --- a tela ----------------------------------------------------------------
 
 class _ColunaFake:
@@ -5193,40 +4819,6 @@ def test_emprestimo_de_balcao_ponta_a_ponta_pela_tela_real(tmp_path, monkeypatch
         ).scalar_one() == "Emprestado"
 
 
-def test_migracao_adiciona_is_simplified_sem_mexer_em_quem_ja_existe(
-    tmp_path, bootstrap_secrets
-):
-    """Banco criado antes do cadastro de balcão: a coluna entra com 0, então
-    toda conta existente continua sendo conta completa e continua logando."""
-    import sqlite3
-
-    db_path = tmp_path / "legado_simplificado.db"
-    raw = sqlite3.connect(db_path)
-    raw.executescript(
-        """
-        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
-          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
-          salt TEXT NOT NULL, role TEXT NOT NULL,
-          must_change_password INTEGER NOT NULL DEFAULT 0,
-          session_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-        """
-    )
-    raw.execute(
-        "INSERT INTO users VALUES (1,'Maria','maria@x.org','',?,'','leitor',0,0,'2026-01-01')",
-        (hash_password("SenhaAntiga1"),),
-    )
-    raw.commit()
-    raw.close()
-
-    database_url = f"sqlite:///{db_path}"
-    create_schema(get_engine(database_url))  # dispara a migração
-
-    with get_connection(database_url) as connection:
-        maria = get_user_by_email(connection, "maria@x.org")
-        assert maria["is_simplified"] == 0
-        assert authenticate(connection, "maria@x.org", "SenhaAntiga1") is not None
-
-
 def test_catalogo_do_admin_nao_faz_uma_busca_de_leitor_por_livro(conn, monkeypatch):
     """O corpo do popover roda a cada rerun, aberto ou não: sem memória por
     render, uma página de 25 livros viraria 25 buscas de leitor."""
@@ -5255,3 +4847,43 @@ def test_catalogo_do_admin_nao_faz_uma_busca_de_leitor_por_livro(conn, monkeypat
 
     assert len(buscas) == 1      # um termo distinto, uma consulta
     assert len(contagens) == 1
+
+
+def test_banco_com_a_coluna_is_simplified_orfa_continua_funcionando(
+    tmp_path, bootstrap_secrets
+):
+    """A coluna do cadastro de balcão foi removida do código, não do banco: um
+    ambiente que rodou a versão anterior ficou com ela sobrando.
+
+    Como ela é NOT NULL DEFAULT 0 e nenhum INSERT do app a nomeia, o default
+    resolve — cadastro, login e listagem seguem funcionando sem DROP COLUMN.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "coluna_orfa.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE, phone TEXT, password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL, role TEXT NOT NULL,
+          must_change_password INTEGER NOT NULL DEFAULT 0,
+          session_version INTEGER NOT NULL DEFAULT 0,
+          is_simplified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database_url = f"sqlite:///{db_path}"
+    create_schema(get_engine(database_url))  # não deve tentar mexer na coluna
+
+    with get_connection(database_url) as connection:
+        create_user(connection, "Maria", "maria@x.org", "", "SenhaNova12", "leitor")
+        connection.commit()
+        assert authenticate(connection, "maria@x.org", "SenhaNova12") is not None
+        assert [u["full_name"] for u in list_users(connection)] == ["Maria"]
+        # a coluna continua lá, zerada, e ninguém no código a lê
+        assert connection.execute(
+            text("SELECT is_simplified FROM users WHERE email = 'maria@x.org'")
+        ).scalar_one() == 0
