@@ -1,0 +1,36 @@
+# Mantém o projeto gratuito do Supabase ativo (ele pausa depois de 7 dias sem
+# atividade) e confere que toda tabela do schema public tem RLS.
+#
+# Só agenda e disparo manual: nunca pull_request. O repositório é público, e
+# um PR de terceiros não pode rodar código com acesso ao secret do banco.
+name: Heartbeat do Supabase
+
+on:
+  schedule:
+    # a cada 3 dias, às 09:17 UTC (fora da hora cheia, quando o GitHub atrasa
+    # os agendamentos)
+    - cron: "17 9 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Só o driver, na versão fixada no requirements.txt
+      - name: Instalar o psycopg2
+        run: pip install psycopg2-binary==2.9.13
+
+      - name: Heartbeat e conferência de RLS
+        run: python scripts/heartbeat.py
+        env:
+          SUPABASE_POOLER_URL: ${{ secrets.SUPABASE_POOLER_URL }}
